@@ -1,0 +1,775 @@
+"""
+AIAURA outbound sales voice agent — backend.
+
+Flow:
+  1. Dashboard calls POST /calls/trigger with a phone number.
+  2. We create a Twilio outbound call, pointing Twilio at /twiml/voice.
+  3. Twilio requests /twiml/voice -> we return TwiML that opens a media
+     stream websocket back to us (/media-stream).
+  4. Twilio connects to /media-stream and streams the call's audio to us in
+     real time (8kHz mulaw, base64-encoded chunks).
+  5. We transcode that audio (8kHz mulaw -> 16kHz PCM) and forward it to the
+     Google Gemini Live API over a WebSocket (via the google-genai SDK), then
+     transcode Gemini's 24kHz PCM reply back to 8kHz mulaw for Twilio.
+  6. Gemini's server-side VAD detects when the caller starts speaking and, by
+     default (`START_OF_ACTIVITY_INTERRUPTS` / "barge-in"), immediately cuts
+     off the model's in-flight response. It signals this with
+     `server_content.interrupted` — on that event we tell Twilio to clear its
+     playback buffer. That's what makes the agent "stop the instant you speak."
+  7. When the model decides the call outcome, it calls the `log_call_outcome`
+     tool, which we handle by writing a row to Supabase (leads table) that
+     the dashboard is subscribed to in real time.
+
+The browser test-call page (`/ws/test-call`) relays your mic directly to the
+same Gemini Live session through this backend, so the agent logic, tools, and
+Supabase logging are identical to the Twilio path — just with your microphone
+instead of a phone line (no Twilio account needed for that part).
+
+Run:
+    uvicorn main:app --reload --port 8000
+And separately: ngrok http 8000  (Twilio needs a public HTTPS/WSS URL)
+"""
+
+import asyncio
+import base64
+import json
+import os
+import re
+from datetime import datetime, timezone
+
+import websockets.exceptions
+from dotenv import load_dotenv
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from google import genai
+from google.genai import errors, types
+from pydantic import BaseModel
+from supabase import create_client
+from twilio.rest import Client as TwilioClient
+from twilio.twiml.voice_response import VoiceResponse, Connect
+
+from audio_convert import Mulaw8kToPcm16k, Pcm24kToMulaw8k
+from system_prompt import SYSTEM_PROMPT
+
+load_dotenv()
+
+TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
+TWILIO_PHONE_NUMBER = os.environ["TWILIO_PHONE_NUMBER"]
+PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
+GOOGLE_AI_STUDIO_API_KEY = os.environ["GOOGLE_AI_STUDIO_API_KEY"]
+GEMINI_LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-preview")
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+# Gemini Live client. Uses the free Google AI Studio API key (no billing).
+genai_client = genai.Client(api_key=GOOGLE_AI_STUDIO_API_KEY)
+
+# OpenAI Agents SDK client — optional; the Gemini Live voice path below is
+# the primary agent runtime and must never be blocked by these imports.
+openai_client = None
+try:
+    import openai as openai_lib
+    openai_client = openai_lib.Client(api_key=os.environ.get("OPENAI_API_KEY", ""))
+except Exception as e:
+    print(f"[warn] OpenAI SDK unavailable (agent compliance path optional): {e}")
+
+# Claude Agent SDK client — optional, same rationale as above.
+claude_client = None
+try:
+    import anthropic
+    claude_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+except Exception as e:
+    print(f"[warn] Claude SDK unavailable (agent compliance path optional): {e}")
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost",
+        "http://localhost:3000",
+        "http://127.0.0.1",
+        "http://127.0.0.1:3000",
+    ],
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# The two tools the agent can call, as Gemini Live `FunctionDeclaration`s.
+# Gemini wraps function declarations in a Tool via `function_declarations`.
+GEMINI_TOOLS = [
+    {
+        "function_declarations": [
+            {
+                "name": "log_call_outcome",
+                "description": "Log the outcome of this call once it's known.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "contact_name": {
+                            "type": "STRING",
+                            "description": "The name of the prospect/business owner."
+                        },
+                        "business_name": {
+                            "type": "STRING",
+                            "description": "The name of the business."
+                        },
+                        "outcome": {
+                            "type": "STRING",
+                            "enum": [
+                                "booked",
+                                "callback",
+                                "not_interested",
+                                "do_not_call",
+                                "voicemail"
+                            ]
+                        },
+                        "notes": {
+                            "type": "STRING",
+                            "description": "What the agent learned on the call."
+                        },
+                        "followup_time": {
+                            "type": "STRING",
+                            "description": "ISO 8601 datetime, only if outcome is 'booked' or 'callback'."
+                        }
+                    },
+                    "required": [
+                        "contact_name",
+                        "outcome",
+                        "notes"
+                    ]
+                }
+            },
+            {
+                "name": "end_call",
+                "description": "End the call cleanly after saying goodbye and logging the outcome.",
+                "parameters": {"type": "OBJECT", "properties": {}},
+            },
+        ]
+    }
+]
+
+# Shared Live API config: system prompt, tools, and server-side VAD for turn
+# detection / barge-in. `activity_handling` defaults to
+# `START_OF_ACTIVITY_INTERRUPTS`, i.e. the model's response is automatically
+# cut off the moment the caller starts speaking (server-side "barge-in").
+GEMINI_LIVE_CONFIG = {
+    "response_modalities": ["AUDIO"],
+    "system_instruction": SYSTEM_PROMPT,
+    "tools": GEMINI_TOOLS,
+    # Lets us see (in the browser test log) whether Gemini is actually
+    # hearing you — invaluable while debugging, cheap to leave on.
+    "input_audio_transcription": {},
+    "output_audio_transcription": {},  # lets the agent's spoken reply also show as text
+    "realtime_input_config": {
+        "automatic_activity_detection": {
+            "disabled": False,
+            "start_of_speech_sensitivity": "START_SENSITIVITY_HIGH",
+            "end_of_speech_sensitivity": "END_SENSITIVITY_HIGH",
+            "prefix_padding_ms": 300,
+            "silence_duration_ms": 500,
+        },
+    },
+}
+
+# Keep-alive / reconnection tuning.
+KEEPALIVE_INTERVAL_S = 15      # active ping/pong heartbeat period
+RECONNECT_BACKOFF_S = 1.0      # initial delay before reconnecting
+RECONNECT_MAX_BACKOFF_S = 8.0  # cap on exponential reconnect backoff
+AUDIO_QUEUE_MAX = 300          # bounded buffer of 16kHz PCM frames (~few seconds)
+
+
+def build_live_config(resumption_handle: str | None = None) -> dict:
+    """Return a copy of GEMINI_LIVE_CONFIG with session resumption enabled.
+
+    Pass `resumption_handle` to resume a previous session after a dropped
+    socket; pass None on the first connect to start a fresh session. Enabling
+    `session_resumption` makes Gemini send `session_resumption_update` messages
+    containing the `new_handle` we persist for reconnects.
+    """
+    config = dict(GEMINI_LIVE_CONFIG)
+    if resumption_handle:
+        config["session_resumption"] = {"handle": resumption_handle}
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Dashboard-facing REST API
+# ---------------------------------------------------------------------------
+
+class TriggerCallRequest(BaseModel):
+    phone_number: str  # E.164 format, e.g. +15551234567
+
+
+E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+
+
+@app.post("/calls/trigger")
+async def trigger_call(req: TriggerCallRequest):
+    """Called by the dashboard when someone adds a number and hits 'Call'."""
+    if not E164_RE.match(req.phone_number):
+        return Response(status_code=422, content='{"detail":"phone_number must be E.164 format, e.g. +15551234567"}',
+                        media_type="application/json")
+    call = twilio_client.calls.create(
+        to=req.phone_number,
+        from_=TWILIO_PHONE_NUMBER,
+        url=f"{PUBLIC_BASE_URL}/twiml/voice",
+        machine_detection="DetectMessageEnd",
+        async_amd=True,
+        async_amd_status_callback=f"{PUBLIC_BASE_URL}/twiml/amd-status",
+        status_callback=f"{PUBLIC_BASE_URL}/twiml/status",
+        status_callback_event=["initiated", "ringing", "answered", "completed", "busy", "no-answer", "failed", "canceled"],
+    )
+
+    # Pre-create the lead row so it shows up on the dashboard immediately,
+    # even before the model has said anything.
+    supabase.table("leads").insert(
+        {
+            "call_sid": call.sid,
+            "phone_number": req.phone_number,
+            "outcome": "in_progress",
+            "call_status": "in_progress",
+        }
+    ).execute()
+
+    return {"call_sid": call.sid, "status": call.status}
+
+
+@app.post("/calls/{call_sid}/end")
+async def end_call(call_sid: str):
+    """Best-effort hangup of an in-progress Twilio call.
+
+    The dashboard's red End Call button closes the browser harness and, when a
+    real outbound call is tracked, asks Twilio to complete it. Idempotent and
+    safe to call after the call already ended (Twilio just returns the call
+    with its current status).
+    """
+    try:
+        call = twilio_client.calls(call_sid).update(status="completed")
+        return {"call_sid": call_sid, "status": call.status}
+    except Exception as e:
+        # The call may already be terminal — not fatal to the caller.
+        print(f"[calls/{call_sid}/end] could not hang up: {e}")
+        return {"call_sid": call_sid, "status": "unknown", "note": str(e)}
+
+
+@app.post("/twiml/status")
+async def call_status(request: Request):
+    """Twilio posts here when the call completes, in case the model never
+    got a chance to log an outcome (e.g. the line just didn't pick up)."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    call_status = form.get("CallStatus")
+    # Technical call state — never corrupt business outcome semantics.
+    # no-answer, busy, failed, canceled are call-state failures, NOT prospect
+    # intent. We record them in `call_status` and keep `outcome` untouched
+    # (it stays 'in_progress' = no business outcome determined).
+    supabase.table("leads").update({"call_status": call_status}).eq("call_sid", call_sid).execute()
+    return Response(status_code=204)
+
+
+@app.post("/twiml/amd-status")
+async def amd_status(request: Request):
+    """Twilio's Answering Machine Detection callback."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    answered_by = form.get("AnsweredBy", "")
+    if "machine" in answered_by:
+        supabase.table("leads").update({"outcome": "voicemail", "call_status": "completed"}).eq("call_sid", call_sid).execute()
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Twilio voice webhook — opens the media stream
+# ---------------------------------------------------------------------------
+
+@app.api_route("/twiml/voice", methods=["GET", "POST"])
+async def twiml_voice():
+    response = VoiceResponse()
+    connect = Connect()
+    connect.stream(url=f"{PUBLIC_BASE_URL.replace('https', 'wss')}/media-stream")
+    response.append(connect)
+    return Response(content=str(response), media_type="application/xml")
+
+
+# ---------------------------------------------------------------------------
+# Gemini Live session manager (shared by the Twilio and browser bridges)
+# ---------------------------------------------------------------------------
+# The google-genai SDK opens the Live WebSocket for us, but it does NOT
+# keep it alive or reconnect. This class wraps that connection so that:
+#   1. It sends an active ping/pong keep-alive every KEEPALIVE_INTERVAL_S.
+#   2. If the socket drops (e.g. ConnectionClosedError 1011 "ping timeout")
+#      it auto-reconnects using Gemini's session_resumption handle, so the
+#      conversation state survives the blip.
+#   3. Incoming 16kHz mono PCM frames are buffered in a bounded queue and
+#      pushed to Gemini by a detached sender task — a slow or dropped frame
+#      can never crash the client receive loop.
+
+
+class GeminiLiveBridge:
+    def __init__(self, client, model: str, base_config: dict):
+        self._client = client
+        self._model = model
+        self._base_config = base_config
+        self._resumption_handle: str | None = None
+        self.session = None  # current live AsyncSession (or None while reconnecting)
+        self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=AUDIO_QUEUE_MAX)
+        self._stopped = asyncio.Event()
+
+    # -- config -------------------------------------------------------------
+    def _make_config(self) -> dict:
+        return build_live_config(self._resumption_handle)
+
+    # -- safe, non-blocking send helpers ------------------------------------
+    def send_audio(self, pcm: bytes) -> None:
+        """Buffer 16kHz mono PCM for the detached sender task.
+
+        Bounded queue: if a client floods faster than Gemini can consume, we
+        drop the oldest frame rather than block or crash the receive loop.
+        """
+        if not _pcm_ok(pcm):
+            return
+        if self._audio_queue.full():
+            try:
+                self._audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            self._audio_queue.put_nowait(pcm)
+        except asyncio.QueueFull:
+            pass
+
+    async def send_text(self, text: str) -> None:
+        """Send a discrete text turn to the current session (guarded)."""
+        session = self.session
+        if session is None:
+            return
+        try:
+            await session.send_client_content(
+                turns=types.Content(role="user", parts=[types.Part(text=text)]),
+                turn_complete=True,
+            )
+        except (websockets.exceptions.ConnectionClosed, errors.APIError) as e:
+            print(f"[GeminiLiveBridge] text send failed (will reconnect): {e}")
+
+    async def send_tool_response(self, responses) -> None:
+        session = self.session
+        if session is None:
+            return
+        try:
+            await session.send_tool_response(function_responses=responses)
+        except (websockets.exceptions.ConnectionClosed, errors.APIError) as e:
+            print(f"[GeminiLiveBridge] tool response send failed (will reconnect): {e}")
+
+    # -- lifecycle ----------------------------------------------------------
+    async def run(self, on_message) -> None:
+        """Connect/reconnect to Gemini and dispatch received messages.
+
+        Only returns once `stop()` is called; on a dropped socket it backs
+        off and reconnects with the latest session_resumption handle.
+        """
+        backoff = RECONNECT_BACKOFF_S
+        while not self._stopped.is_set():
+            try:
+                async with self._client.aio.live.connect(
+                    model=self._model, config=self._make_config()
+                ) as session:
+                    self.session = session
+                    backoff = RECONNECT_BACKOFF_S
+                    print(f"[GeminiLiveBridge] connected (resume={'yes' if self._resumption_handle else 'no'})")
+                    await self._run_session(session, on_message)
+            except websockets.exceptions.ConnectionClosed as e:
+                print(f"[GeminiLiveBridge] session closed ({e}); reconnecting in {backoff}s")
+            except errors.APIError as e:
+                code = getattr(e, "code", None)
+                if code is None or code >= 1000:
+                    # A WebSocket-close code (e.g. 1011 ping timeout) is
+                    # transient -> reconnect.
+                    print(f"[GeminiLiveBridge] session dropped (code={code}); reconnecting in {backoff}s")
+                else:
+                    # A hard/HTTP-style error (e.g. 4xx auth) won't fix itself.
+                    print(f"[GeminiLiveBridge] unrecoverable error (code={code}), giving up: {e}")
+                    raise
+            finally:
+                self.session = None
+
+            if not self._stopped.is_set():
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, RECONNECT_MAX_BACKOFF_S)
+
+    async def _run_session(self, session, on_message) -> None:
+        sender_task = asyncio.create_task(self._audio_sender(session))
+        heartbeat_task = asyncio.create_task(self._heartbeat(session))
+        try:
+            async for msg in session.receive():
+                # Capture the freshest resumption handle offered by the server.
+                if (
+                    msg.session_resumption_update
+                    and msg.session_resumption_update.new_handle
+                ):
+                    self._resumption_handle = msg.session_resumption_update.new_handle
+                await on_message(msg)
+        finally:
+            sender_task.cancel()
+            heartbeat_task.cancel()
+
+    async def _audio_sender(self, session) -> None:
+        """Consume buffered 16kHz PCM frames and send them to Gemini."""
+        while not self._stopped.is_set():
+            try:
+                pcm = await self._audio_queue.get()
+            except asyncio.CancelledError:
+                break
+            if session is None or session is not self.session:
+                continue  # reconnecting; frame was transient, safe to drop
+            try:
+                await session.send_realtime_input(
+                    audio=types.Blob(data=pcm, mime_type="audio/pcm;rate=16000")
+                )
+            except (websockets.exceptions.ConnectionClosed, errors.APIError) as e:
+                print(f"[GeminiLiveBridge] audio send failed (reconnecting): {e}")
+
+    async def _heartbeat(self, session) -> None:
+        """Keep the socket alive with a ping every KEEPALIVE_INTERVAL_S."""
+        try:
+            while not self._stopped.is_set():
+                await asyncio.sleep(KEEPALIVE_INTERVAL_S)
+                if session is not self.session:
+                    continue
+                try:
+                    await session._ws.ping()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    # Socket looks dead — the receive loop will surface the
+                    # close and trigger a reconnect.
+                    print(f"[GeminiLiveBridge] keepalive ping failed: {e}")
+        except asyncio.CancelledError:
+            pass
+
+    def stop(self) -> None:
+        self._stopped.set()
+
+
+def _pcm_ok(pcm: bytes) -> bool:
+    """Drop malformed/empty frames up front so a bad client frame can't crash
+    the queue or the sender task."""
+    return bool(pcm) and len(pcm) % 2 == 0
+
+
+# ---------------------------------------------------------------------------
+# The real-time bridge: Twilio Media Stream <-> Gemini Live API
+# ---------------------------------------------------------------------------
+
+
+@app.websocket("/media-stream")
+async def media_stream(twilio_ws: WebSocket):
+    await twilio_ws.accept()
+
+    stream_sid: str | None = None
+    call_sid: str | None = None
+
+    bridge = GeminiLiveBridge(genai_client, GEMINI_LIVE_MODEL, GEMINI_LIVE_CONFIG)
+    # One converter for the whole Twilio call: it holds streaming resample
+    # state, so resampling stays continuous across audio chunks/turns.
+    to_twilio = Pcm24kToMulaw8k()
+
+    async def handle_tool_call(name: str, call_id: str, args: dict):
+        nonlocal call_sid
+        if name == "log_call_outcome":
+            update = {
+                "outcome": args.get("outcome", "in_progress"),
+                "contact_name": args.get("contact_name"),
+                "business_name": args.get("business_name"),
+                "notes": args.get("notes"),
+            }
+            if args.get("followup_time"):
+                update["followup_time"] = args["followup_time"]
+            update["call_status"] = "completed"  # call reached terminal state via agent action
+            supabase.table("leads").update(update).eq("call_sid", call_sid).execute()
+            result = {"status": "logged"}
+        elif name == "end_call":
+            result = {"status": "ending"}
+            # Also set call_status to completed when the call ends via the tool
+            try:
+                supabase.table("leads").update({"call_status": "completed"}).eq("call_sid", call_sid).execute()
+            except Exception:
+                pass
+        else:
+            result = {"status": "unknown_tool"}
+
+        # Returning the tool response lets Gemini pick the conversation back
+        # up (no separate "response.create" as in OpenAI).
+        await bridge.send_tool_response([{"name": name, "id": call_id, "response": result}])
+
+        if name == "end_call":
+            await twilio_ws.close()
+
+    async def on_message(msg):
+        """Dispatch a Gemini server message to Twilio."""
+        try:
+            if msg.server_content:
+                # Model audio reply -> transcode 24kHz PCM -> 8kHz mulaw.
+                if msg.server_content.model_turn and stream_sid:
+                    for part in msg.server_content.model_turn.parts or []:
+                        if part.inline_data and part.inline_data.data:
+                            mulaw = to_twilio.convert(part.inline_data.data)
+                            if mulaw:
+                                await twilio_ws.send_text(
+                                    json.dumps(
+                                        {
+                                            "event": "media",
+                                            "streamSid": stream_sid,
+                                            "media": {"payload": base64.b64encode(mulaw).decode()},
+                                        }
+                                    )
+                                )
+
+                # THE INTERRUPTION HANDLER: Gemini's VAD detected the caller
+                # speaking and cut off its own response. Tell Twilio to
+                # immediately clear its playback buffer so nothing
+                # already-queued keeps playing.
+                if msg.server_content.interrupted and stream_sid:
+                    await twilio_ws.send_text(
+                        json.dumps({"event": "clear", "streamSid": stream_sid})
+                    )
+
+            elif msg.tool_call and msg.tool_call.function_calls:
+                for fc in msg.tool_call.function_calls:
+                    await handle_tool_call(name=fc.name, call_id=fc.id, args=fc.args or {})
+        except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
+            bridge.stop()
+
+    async def twilio_to_gemini():
+        nonlocal stream_sid, call_sid
+        # Twilio streams 8kHz mulaw; Gemini needs 16kHz PCM, so we transcode
+        # on the way in. The transcoded frames are buffered by the bridge and
+        # sent to Gemini by a detached task (crash-safe).
+        to_gemini = Mulaw8kToPcm16k()
+        try:
+            async for message in twilio_ws.iter_text():
+                data = json.loads(message)
+                event = data.get("event")
+
+                if event == "start":
+                    stream_sid = data["start"]["streamSid"]
+                    call_sid = data["start"]["callSid"]
+
+                elif event == "media":
+                    try:
+                        mulaw = base64.b64decode(data["media"]["payload"])
+                        pcm = to_gemini.convert(mulaw)
+                        if pcm:
+                            bridge.send_audio(pcm)
+                    except Exception as e:
+                        # A single bad frame must never kill this loop.
+                        print(f"[media-stream] dropped bad media frame: {e}")
+
+                elif event == "stop":
+                    break
+        except WebSocketDisconnect:
+            pass
+        finally:
+            # Twilio call is over — stop trying to keep the Gemini session alive.
+            bridge.stop()
+
+    run_task = asyncio.create_task(bridge.run(on_message))
+    client_task = asyncio.create_task(twilio_to_gemini())
+    # End the whole bridge as soon as either side finishes: if Twilio hangs up
+    # we cancel the (possibly blocked) Gemini receive loop; if Gemini gives a
+    # hard error we cancel the Twilio leg.
+    done, pending = await asyncio.wait(
+        {client_task, run_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+    for t in pending:
+        t.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# Browser test-call mode (Phase 1 — no Twilio needed)
+# ---------------------------------------------------------------------------
+# The browser connects to /ws/test-call and we open a single Gemini Live
+# session for it right here in the backend (server-to-server). Your mic audio
+# (16kHz PCM, resampled in the browser) is forwarded straight into the
+# session, and Gemini's 24kHz PCM reply is streamed back to be played in the
+# browser. Same system prompt, same tools, same Supabase logging as Twilio —
+# this just swaps the audio source from "phone call" to "your microphone".
+
+
+@app.websocket("/ws/test-call")
+async def browser_test_call(browser_ws: WebSocket):
+    await browser_ws.accept()
+
+    test_id = ""  # set by the browser on connect
+    bridge = GeminiLiveBridge(genai_client, GEMINI_LIVE_MODEL, GEMINI_LIVE_CONFIG)
+
+    async def handle_tool_call(name: str, call_id: str, args: dict):
+        if name == "log_call_outcome":
+            supabase.table("leads").upsert(
+                {
+                    "call_sid": test_id,
+                    "phone_number": "browser-test",
+                    "outcome": args.get("outcome", "in_progress"),
+                    "contact_name": args.get("contact_name"),
+                    "business_name": args.get("business_name"),
+                    "notes": args.get("notes"),
+                    "call_status": "completed",
+                    "followup_time": args.get("followup_time"),
+                },
+                on_conflict="call_sid",
+            ).execute()
+            if args.get("followup_time"):
+                supabase.table("leads").update({"followup_time": args["followup_time"]}).eq("call_sid", test_id).execute()
+            result = {"status": "logged"}
+        elif name == "end_call":
+            result = {"status": "ending"}
+        else:
+            result = {"status": "unknown_tool"}
+
+        await bridge.send_tool_response([{"name": name, "id": call_id, "response": result}])
+
+        if name == "end_call":
+            await browser_ws.close()
+
+    async def on_message(msg):
+        """Dispatch a Gemini server message to the browser page."""
+        try:
+            print(f"[test-call] <<< from Gemini: {msg}")
+            if msg.server_content:
+                if msg.server_content.model_turn:
+                    for part in msg.server_content.model_turn.parts or []:
+                        if part.inline_data and part.inline_data.data:
+                            await browser_ws.send_text(
+                                json.dumps(
+                                    {
+                                        "type": "audio",
+                                        "data": base64.b64encode(part.inline_data.data).decode(),
+                                        "mime_type": part.inline_data.mime_type,
+                                    }
+                                )
+                            )
+                        elif part.text:
+                            await browser_ws.send_text(json.dumps({"type": "agent_text", "text": part.text}))
+
+                if msg.server_content.interrupted:
+                    await browser_ws.send_text(json.dumps({"type": "interrupted"}))
+
+                if msg.server_content.input_transcription and msg.server_content.input_transcription.text:
+                    await browser_ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "user_transcript",
+                                "text": msg.server_content.input_transcription.text,
+                            }
+                        )
+                    )
+
+                if msg.server_content.output_transcription and msg.server_content.output_transcription.text:
+                    await browser_ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "agent_text",
+                                "text": msg.server_content.output_transcription.text,
+                            }
+                        )
+                    )
+
+            elif msg.tool_call and msg.tool_call.function_calls:
+                for fc in msg.tool_call.function_calls:
+                    await handle_tool_call(name=fc.name, call_id=fc.id, args=fc.args or {})
+        except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
+            bridge.stop()
+
+    async def browser_to_gemini():
+        nonlocal test_id
+        try:
+            async for message in browser_ws.iter_text():
+                data = json.loads(message)
+
+                if data.get("type") == "hello":
+                    test_id = data.get("test_id", f"browser-test-{int(datetime.now().timestamp()*1000)}")
+                    # Don't tell the browser to start streaming until a Gemini
+                    # session is actually live, so the first mic frames aren't
+                    # dropped during the initial connect.
+                    for _ in range(50):  # up to ~5s
+                        if bridge.session is not None:
+                            break
+                        await asyncio.sleep(0.1)
+                    await browser_ws.send_text(json.dumps({"type": "ready"}))
+
+                elif data.get("type") == "audio":
+                    # 16kHz mono PCM from the browser -> buffered safely and
+                    # sent to Gemini by the bridge's detached sender task.
+                    try:
+                        pcm = base64.b64decode(data["data"])
+                        print(f"[test-call] received {len(pcm)} bytes of audio from browser")
+                        bridge.send_audio(pcm)
+                    except Exception as e:
+                        print(f"[test-call] dropped bad audio frame: {e}")
+
+                elif data.get("type") == "text":
+                    # Silent test path — no mic/speakers needed. Sends a
+                    # normal text turn; the agent still replies with
+                    # audio (response_modalities=["AUDIO"]), but since
+                    # output_audio_transcription is on, that reply also
+                    # arrives as text via agent_text — so this works
+                    # completely silently end to end.
+                    print(f"[test-call] received text turn: {data['text']!r}")
+                    await bridge.send_text(data["text"])
+        except WebSocketDisconnect:
+            pass
+        finally:
+            bridge.stop()
+
+    run_task = asyncio.create_task(bridge.run(on_message))
+    client_task = asyncio.create_task(browser_to_gemini())
+    # End the whole bridge as soon as either side finishes: if the browser
+    # disconnects we cancel the (possibly blocked) Gemini receive loop; if
+    # Gemini gives a hard error we cancel the browser leg.
+    done, pending = await asyncio.wait(
+        {client_task, run_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+    for t in pending:
+        t.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+
+class LogTestOutcomeRequest(BaseModel):
+    test_id: str
+    outcome: str
+    business_name: str | None = None
+    contact_name: str | None = None
+    notes: str | None = None
+    followup_time: str | None = None
+
+
+@app.post("/realtime/log-outcome")
+async def log_test_outcome(req: LogTestOutcomeRequest):
+    """Kept for backwards compatibility with any client that posts outcomes
+    directly; the browser test page now routes them through the live session
+    handler instead, but this remains a handy manual fallback."""
+    supabase.table("leads").upsert(
+        {
+            "call_sid": req.test_id,
+            "phone_number": "browser-test",
+            "outcome": req.outcome,
+            "business_name": req.business_name,
+            "contact_name": req.contact_name,
+            "notes": req.notes,
+            "call_status": "completed",
+            "followup_time": req.followup_time,
+        },
+        on_conflict="call_sid",
+    ).execute()
+    return {"status": "logged"}

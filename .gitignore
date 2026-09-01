@@ -1,0 +1,26 @@
+# Dependencies
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Next.js build output
+.next/
+
+# Environment variables (keep .env.local out of version control)
+.env
+.env.local
+.env.production
+
+# Database dump
+*.sql
+
+# OS
+.DS_Storenode_modules/
+frontend/node_modules/
+.next/
+frontend/.next/
+.env*
+venv/
+backend/venv/
