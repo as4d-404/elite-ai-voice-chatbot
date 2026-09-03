@@ -74,8 +74,33 @@ export default function LiveHarness({ onCallStateChange }) {
     if (onCallStateChange) onCallStateChange(s);
   }, [onCallStateChange]);
 
-  const appendBubble = useCallback((who, text) => {
-    setBubbles((prev) => [...prev.slice(-200), { id: ++bubbleSeq, who, text, time: now() }]);
+  const appendBubble = useCallback((who, text, open = false) => {
+    setBubbles((prev) => [
+      ...prev.slice(-200),
+      { id: ++bubbleSeq, who, text, time: now(), open },
+    ]);
+  }, []);
+
+  const addTurnText = useCallback((who, text) => {
+    setBubbles((prev) => {
+      const last = prev[prev.length - 1];
+      if (last && last.who === who && last.open) {
+        return [...prev.slice(0, prev.length - 1), { ...last, text: last.text + text }].slice(-200);
+      }
+      return [
+        ...prev.slice(-200),
+        { id: ++bubbleSeq, who, text, time: now(), open: true },
+      ];
+    });
+  }, []);
+
+  const closeOpenBubble = useCallback(() => {
+    setBubbles((prev) => {
+      if (!prev.length) return prev;
+      const last = prev[prev.length - 1];
+      if (!last.open) return prev;
+      return [...prev.slice(0, prev.length - 1), { ...last, open: false }];
+    });
   }, []);
 
   useEffect(() => {
@@ -233,7 +258,9 @@ export default function LiveHarness({ onCallStateChange }) {
     appendBubble("system", "Opening audio harness…");
 
     try {
-      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
       micStreamRef.current = micStream;
     } catch {
       setStatusNow("idle");
@@ -247,7 +274,10 @@ export default function LiveHarness({ onCallStateChange }) {
     const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
 
+    console.log("[LiveHarness] Connecting to WebSocket:", WS_URL);
+
     ws.addEventListener("open", () => {
+      console.log("[LiveHarness] WebSocket opened");
       ws.send(JSON.stringify({ type: "hello", test_id: testIdRef.current }));
     });
 
@@ -270,29 +300,39 @@ export default function LiveHarness({ onCallStateChange }) {
       } else if (msg.type === "audio") {
         enqueuePcm(msg.data);
       } else if (msg.type === "agent_text") {
-        appendBubble("agent", msg.text);
+        addTurnText("agent", msg.text);
         setAgentSpeaking(true);
         if (speakTimerRef.current) clearTimeout(speakTimerRef.current);
-        speakTimerRef.current = setTimeout(() => setAgentSpeaking(false), 1400);
+        speakTimerRef.current = setTimeout(() => {
+          setAgentSpeaking(false);
+          closeOpenBubble();
+        }, 1400);
       } else if (msg.type === "user_transcript") {
-        appendBubble("prospect", msg.text);
+        addTurnText("prospect", msg.text);
       } else if (msg.type === "interrupted") {
         setAgentSpeaking(false);
+        closeOpenBubble();
         appendBubble("system", "Interrupted — you spoke first.");
       }
     });
 
-    ws.addEventListener("close", () => {
+    ws.addEventListener("error", (e) => {
+      console.error("[LiveHarness] WebSocket error:", e);
+      setStatusNow("ended");
+      appendBubble("system", `WebSocket error — check backend is running. (see console)`);
+    });
+
+    ws.addEventListener("close", (e) => {
+      console.log("[LiveHarness] WebSocket closed:", {
+        code: e.code,
+        reason: e.reason,
+        wasClean: e.wasClean,
+      });
       setAgentSpeaking(false);
       if (statusRef.current !== "idle" && statusRef.current !== "ended") {
         setStatusNow("ended");
-        appendBubble("system", "Connection closed.");
+        appendBubble("system", `Connection closed (code=${e.code}, clean=${e.wasClean}).`);
       }
-    });
-
-    ws.addEventListener("error", () => {
-      setStatusNow("ended");
-      appendBubble("system", "WebSocket error — check backend is running.");
     });
   }
 

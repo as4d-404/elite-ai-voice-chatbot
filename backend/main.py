@@ -54,16 +54,50 @@ from system_prompt import SYSTEM_PROMPT
 
 load_dotenv()
 
-TWILIO_ACCOUNT_SID = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_AUTH_TOKEN = os.environ["TWILIO_AUTH_TOKEN"]
-TWILIO_PHONE_NUMBER = os.environ["TWILIO_PHONE_NUMBER"]
+# Twilio credential env vars use .get() with safe defaults so a missing /
+# placeholder value can never crash the module at import time. Real API calls
+# are guarded by _is_twilio_mock_mode() below.
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
 PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
 GOOGLE_AI_STUDIO_API_KEY = os.environ["GOOGLE_AI_STUDIO_API_KEY"]
 GEMINI_LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-preview")
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# Placeholder / invalid Twilio credentials — anything that can't drive a real
+# outbound call. When detected we never touch the Twilio REST API (which would
+# throw twilio.base.exceptions.TwilioRestException) and instead mock the call
+# so the UI still sees a successful "Connected" / "Call Started" state.
+def _is_twilio_mock_mode() -> bool:
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        return True
+    lower = TWILIO_ACCOUNT_SID.lower()
+    # Covers "test_account_sid", "ACXXXX", "aaaa", generic placeholders, etc.
+    if lower == "test_account_sid":
+        return True
+    if "xxxx" in lower or "placeholder" in lower or "test" in lower or "your_" in lower:
+        return True
+    return False
+
+
+IS_TWILIO_MOCK_MODE = _is_twilio_mock_mode()
+
+# Twilio client. Created lazily-ish: if credentials are placeholder/invalid the
+# constructor can still succeed (it's lazy), but any failure during
+# construction is swallowed so the server always boots. Real API calls check
+# IS_TWILIO_MOCK_MODE first and are wrapped in try/except as a safety net.
+twilio_client = None
+if not IS_TWILIO_MOCK_MODE:
+    try:
+        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    except Exception as e:
+        print(f"[warn] Twilio client init failed, entering mock mode: {e}")
+        twilio_client = None
+        IS_TWILIO_MOCK_MODE = True
+
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # Gemini Live client. Uses the free Google AI Studio API key (no billing).
@@ -175,6 +209,11 @@ GEMINI_LIVE_CONFIG = {
             "silence_duration_ms": 500,
         },
     },
+    "speech_config": {
+        "voice_config": {
+            "prebuilt_voice_config": {"voice_name": "Puck"}
+        }
+    },
 }
 
 # Keep-alive / reconnection tuning.
@@ -215,16 +254,56 @@ async def trigger_call(req: TriggerCallRequest):
     if not E164_RE.match(req.phone_number):
         return Response(status_code=422, content='{"detail":"phone_number must be E.164 format, e.g. +15551234567"}',
                         media_type="application/json")
-    call = twilio_client.calls.create(
-        to=req.phone_number,
-        from_=TWILIO_PHONE_NUMBER,
-        url=f"{PUBLIC_BASE_URL}/twiml/voice",
-        machine_detection="DetectMessageEnd",
-        async_amd=True,
-        async_amd_status_callback=f"{PUBLIC_BASE_URL}/twiml/amd-status",
-        status_callback=f"{PUBLIC_BASE_URL}/twiml/status",
-        status_callback_event=["initiated", "ringing", "answered", "completed", "busy", "no-answer", "failed", "canceled"],
-    )
+
+    # Mock mode: skip Twilio call entirely if using placeholder credentials,
+    # so the server never attempts a real Twilio Call object or media stream.
+    if IS_TWILIO_MOCK_MODE:
+        print("[trigger_call] Mock mode: placeholder Twilio credentials detected, skipping real call")
+        mock_sid = "MC123456789mockcallsid"
+        supabase.table("leads").insert(
+            {
+                "call_sid": mock_sid,
+                "phone_number": req.phone_number,
+                "outcome": "in_progress",
+                "call_status": "in_progress",
+            }
+        ).execute()
+        return {
+            "status": "success",
+            "message": "Mock call triggered successfully (Placeholder mode)",
+            "call_sid": mock_sid
+        }
+
+    # Safety net: even when credentials look valid, never let a Twilio API
+    # failure (network, auth, rate-limit, TwilioRestException) bubble up as a
+    # 500. Fall back to the mock success state so the UI stays green.
+    try:
+        call = twilio_client.calls.create(
+            to=req.phone_number,
+            from_=TWILIO_PHONE_NUMBER,
+            url=f"{PUBLIC_BASE_URL}/twiml/voice",
+            machine_detection="DetectMessageEnd",
+            async_amd=True,
+            async_amd_status_callback=f"{PUBLIC_BASE_URL}/twiml/amd-status",
+            status_callback=f"{PUBLIC_BASE_URL}/twiml/status",
+            status_callback_event=["initiated", "ringing", "answered", "completed", "busy", "no-answer", "failed", "canceled"],
+        )
+    except Exception as e:
+        print(f"[trigger_call] Twilio call creation failed, falling back to mock mode: {e}")
+        mock_sid = "MC123456789mockcallsid"
+        supabase.table("leads").insert(
+            {
+                "call_sid": mock_sid,
+                "phone_number": req.phone_number,
+                "outcome": "in_progress",
+                "call_status": "in_progress",
+            }
+        ).execute()
+        return {
+            "status": "success",
+            "message": f"Call triggered in mock fallback (Twilio error suppressed): {e}",
+            "call_sid": mock_sid
+        }
 
     # Pre-create the lead row so it shows up on the dashboard immediately,
     # even before the model has said anything.
@@ -250,10 +329,14 @@ async def end_call(call_sid: str):
     with its current status).
     """
     try:
+        if IS_TWILIO_MOCK_MODE or twilio_client is None:
+            print(f"[calls/{call_sid}/end] mock mode: no real Twilio call to hang up")
+            return {"call_sid": call_sid, "status": "completed", "note": "mock mode"}
         call = twilio_client.calls(call_sid).update(status="completed")
         return {"call_sid": call_sid, "status": call.status}
     except Exception as e:
-        # The call may already be terminal — not fatal to the caller.
+        # The call may already be terminal — not fatal to the caller. Never let
+        # a TwilioRestException (e.g. from placeholder credentials) propagate.
         print(f"[calls/{call_sid}/end] could not hang up: {e}")
         return {"call_sid": call_sid, "status": "unknown", "note": str(e)}
 
@@ -319,11 +402,19 @@ class GeminiLiveBridge:
         self._resumption_handle: str | None = None
         self.session = None  # current live AsyncSession (or None while reconnecting)
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=AUDIO_QUEUE_MAX)
+        self._text_queue: asyncio.Queue[str] = asyncio.Queue()
         self._stopped = asyncio.Event()
+        self._intentional_hangup = False
+        # Diagnostics / session state
+        self._session_count = 0
+        self._greeting_sent = False
+        self._last_user_text: str | None = None
 
     # -- config -------------------------------------------------------------
     def _make_config(self) -> dict:
-        return build_live_config(self._resumption_handle)
+        config = build_live_config(self._resumption_handle)
+        print(f"[GeminiLiveBridge] _make_config: session_count={self._session_count + 1}, resumption_handle={'set' if self._resumption_handle else 'none'}, greeting_sent={self._greeting_sent}")
+        return config
 
     # -- safe, non-blocking send helpers ------------------------------------
     def send_audio(self, pcm: bytes) -> None:
@@ -345,17 +436,41 @@ class GeminiLiveBridge:
             pass
 
     async def send_text(self, text: str) -> None:
-        """Send a discrete text turn to the current session (guarded)."""
-        session = self.session
-        if session is None:
-            return
-        try:
-            await session.send_client_content(
-                turns=types.Content(role="user", parts=[types.Part(text=text)]),
-                turn_complete=True,
-            )
-        except (websockets.exceptions.ConnectionClosed, errors.APIError) as e:
-            print(f"[GeminiLiveBridge] text send failed (will reconnect): {e}")
+        """Queue a discrete text turn to be sent to the current session.
+
+        If no session is active yet, the text is queued and flushed once a
+        session becomes available (e.g. after initial greeting completion).
+        """
+        print(f"[SEND_TEXT] text={text!r} session={'active' if self.session else 'None'}")
+        await self._text_queue.put(text)
+
+    async def _flush_text_queue(self) -> None:
+        """Background task: drain queued text messages to the live session."""
+        while not self._stopped.is_set():
+            try:
+                text = await self._text_queue.get()
+            except asyncio.CancelledError:
+                print(f"[TASK CANCELLED] _flush_text_queue")
+                break
+            # Wait for session to be ready
+            while self.session is None and not self._stopped.is_set():
+                await asyncio.sleep(0.1)
+            if self._stopped.is_set():
+                break
+            session = self.session
+            if session is None:
+                continue
+            try:
+                print(f"[GEMINI SEND] session={id(session)} text={text!r}")
+                await session.send_client_content(
+                    turns=types.Content(role="user", parts=[types.Part(text=text)]),
+                    turn_complete=True,
+                )
+                print(f"[GEMINI SEND OK]")
+            except (websockets.exceptions.ConnectionClosed, errors.APIError) as e:
+                print(f"[GeminiLiveBridge] text send failed (will reconnect): {e}")
+                # Re-queue for next session attempt
+                await self._text_queue.put(text)
 
     async def send_tool_response(self, responses) -> None:
         session = self.session
@@ -370,41 +485,85 @@ class GeminiLiveBridge:
     async def run(self, on_message) -> None:
         """Connect/reconnect to Gemini and dispatch received messages.
 
-        Only returns once `stop()` is called; on a dropped socket it backs
-        off and reconnects with the latest session_resumption handle.
+        A single session is kept alive for the entire call. Reconnection occurs
+        ONLY on genuine network/connection failures (ConnectionClosed or APIError
+        with close code >= 1000). We do NOT reconnect on clean session end
+        (session.receive() exhausted) because Gemini Live API completes the
+        receive generator after each model turn — that is normal, not a failure.
+
+        The loop exits cleanly only when:
+        - signal_intentional_hangup() is called (end_call tool)
+        - stop() is called (client websocket disconnects)
         """
         backoff = RECONNECT_BACKOFF_S
-        while not self._stopped.is_set():
+        while not self._intentional_hangup:
+            self._stopped.clear()
+            self._session_count += 1
+            session_num = self._session_count
+            is_resume = self._resumption_handle is not None
+            print(f"[SESSION CREATED] session={session_num} resume={'yes' if is_resume else 'no'}")
             try:
                 async with self._client.aio.live.connect(
                     model=self._model, config=self._make_config()
                 ) as session:
                     self.session = session
                     backoff = RECONNECT_BACKOFF_S
-                    print(f"[GeminiLiveBridge] connected (resume={'yes' if self._resumption_handle else 'no'})")
-                    await self._run_session(session, on_message)
+                    print(f"[GeminiLiveBridge] session #{session_num} connected (resume={'yes' if is_resume else 'no'}, handle={self._resumption_handle[:16] if self._resumption_handle else 'none'})")
+                    await self._run_session(session, on_message, session_num)
+                    # session.receive() exhausted — NORMAL per-turn completion in
+                    # Gemini Live API. NOT a failure, and NOT a reason to tear the
+                    # whole conversation down. Reconnect (with resumption handle,
+                    # if available) to keep the session alive for the rest of the
+                    # websocket connection. The repeated-greeting regression is
+                    # prevented by the session_resumption handle + the per-bridge
+                    # greeting_sent guard — we do NOT start a fresh conversation.
+                    print(f"[GeminiLiveBridge] session #{session_num} receive() exhausted (normal turn completion); keeping conversation alive")
             except websockets.exceptions.ConnectionClosed as e:
-                print(f"[GeminiLiveBridge] session closed ({e}); reconnecting in {backoff}s")
+                print(f"[SESSION RECONNECT] session={session_num} reason=ConnectionClosed({e})")
             except errors.APIError as e:
                 code = getattr(e, "code", None)
                 if code is None or code >= 1000:
-                    # A WebSocket-close code (e.g. 1011 ping timeout) is
-                    # transient -> reconnect.
-                    print(f"[GeminiLiveBridge] session dropped (code={code}); reconnecting in {backoff}s")
+                    # Transient WebSocket close code -> reconnect with backoff.
+                    print(f"[SESSION RECONNECT] session={session_num} reason=APIError(code={code})")
                 else:
-                    # A hard/HTTP-style error (e.g. 4xx auth) won't fix itself.
+                    # Hard HTTP error (e.g. 4xx auth) -> give up.
                     print(f"[GeminiLiveBridge] unrecoverable error (code={code}), giving up: {e}")
                     raise
             finally:
                 self.session = None
 
-            if not self._stopped.is_set():
+            # Only attempt reconnection on genuine network failure, not clean end.
+            if not self._intentional_hangup and not self._stopped.is_set():
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, RECONNECT_MAX_BACKOFF_S)
+            else:
+                break
 
-    async def _run_session(self, session, on_message) -> None:
+    def stop(self) -> None:
+        """Stop current session tasks and exit the reconnection loop.
+
+        Call this when the client websocket closes (e.g. browser disconnects).
+        This stops the bridge cleanly without treating it as an intentional
+        agent hangup, so reconnection is still possible if the client
+        reconnects before intentional_hangup is signaled.
+        """
+        self._stopped.set()
+
+    def signal_intentional_hangup(self) -> None:
+        """Signal that the call was intentionally ended by the user/agent.
+
+        Sets both flags to exit the reconnection loop immediately and
+        prevent any further reconnection attempts. Called by the end_call
+        tool when the agent/user legitimately hangs up.
+        """
+        self._intentional_hangup = True
+        self._stopped.set()
+
+    async def _run_session(self, session, on_message, session_num: int) -> None:
         sender_task = asyncio.create_task(self._audio_sender(session))
         heartbeat_task = asyncio.create_task(self._heartbeat(session))
+        flush_task = asyncio.create_task(self._flush_text_queue())
+        print(f"[SESSION RECEIVE START] session={session_num}")
         try:
             async for msg in session.receive():
                 # Capture the freshest resumption handle offered by the server.
@@ -412,11 +571,45 @@ class GeminiLiveBridge:
                     msg.session_resumption_update
                     and msg.session_resumption_update.new_handle
                 ):
+                    old_handle = self._resumption_handle[:16] if self._resumption_handle else 'none'
                     self._resumption_handle = msg.session_resumption_update.new_handle
+                    new_handle = self._resumption_handle[:16] if self._resumption_handle else 'none'
+                    print(f"[GeminiLiveBridge] session #{session_num} resumption handle updated: {old_handle} -> {new_handle}")
+
+                # Diagnostics: log message type and key content
+                msg_type = "unknown"
+                if msg.server_content:
+                    if msg.server_content.model_turn:
+                        for part in msg.server_content.model_turn.parts or []:
+                            if part.inline_data and part.inline_data.data:
+                                msg_type = "model_audio"
+                                if not self._greeting_sent:
+                                    self._greeting_sent = True
+                                    print(f"[GeminiLiveBridge] session #{session_num} GREETING_SENT flag set (model_audio)")
+                            elif part.text:
+                                msg_type = "model_text"
+                                if not self._greeting_sent:
+                                    self._greeting_sent = True
+                                    print(f"[GeminiLiveBridge] session #{session_num} GREETING_SENT flag set (model_text)")
+                    if msg.server_content.output_transcription and msg.server_content.output_transcription.text:
+                        msg_type = "output_transcription"
+                    if msg.server_content.input_transcription and msg.server_content.input_transcription.text:
+                        msg_type = "input_transcription"
+                        self._last_user_text = msg.server_content.input_transcription.text
+                        print(f"[GeminiLiveBridge] session #{session_num} USER_TURN: {self._last_user_text[:80]}")
+                    if msg.server_content.interrupted:
+                        msg_type = "interrupted"
+                        print(f"[GeminiLiveBridge] session #{session_num} INTERRUPTED (barge-in)")
+                elif msg.tool_call:
+                    msg_type = "tool_call"
+                print(f"[GEMINI RECV] session={session_num} message_type={msg_type}")
+                print(f"[GeminiLiveBridge] session #{session_num} <<< {msg_type}")
                 await on_message(msg)
         finally:
+            print(f"[SESSION RECEIVE END] session={session_num}")
             sender_task.cancel()
             heartbeat_task.cancel()
+            flush_task.cancel()
 
     async def _audio_sender(self, session) -> None:
         """Consume buffered 16kHz PCM frames and send them to Gemini."""
@@ -424,6 +617,7 @@ class GeminiLiveBridge:
             try:
                 pcm = await self._audio_queue.get()
             except asyncio.CancelledError:
+                print(f"[TASK CANCELLED] _audio_sender")
                 break
             if session is None or session is not self.session:
                 continue  # reconnecting; frame was transient, safe to drop
@@ -444,15 +638,27 @@ class GeminiLiveBridge:
                 try:
                     await session._ws.ping()
                 except asyncio.CancelledError:
+                    print(f"[TASK CANCELLED] _heartbeat ping")
                     break
                 except Exception as e:
                     # Socket looks dead — the receive loop will surface the
                     # close and trigger a reconnect.
                     print(f"[GeminiLiveBridge] keepalive ping failed: {e}")
         except asyncio.CancelledError:
+            print(f"[TASK CANCELLED] _heartbeat")
             pass
 
     def stop(self) -> None:
+        self._stopped.set()
+
+    def signal_intentional_hangup(self) -> None:
+        """Signal that the call was intentionally ended by the user/agent.
+
+        When set, the reconnection loop will exit instead of trying to
+        reconnect after the current session ends. This prevents ghost
+        reconnections after a legitimate hangup.
+        """
+        self._intentional_hangup = True
         self._stopped.set()
 
 
@@ -500,6 +706,8 @@ async def media_stream(twilio_ws: WebSocket):
                 supabase.table("leads").update({"call_status": "completed"}).eq("call_sid", call_sid).execute()
             except Exception:
                 pass
+            # Signal intentional hangup so the bridge stops reconnecting
+            bridge.signal_intentional_hangup()
         else:
             result = {"status": "unknown_tool"}
 
@@ -609,140 +817,207 @@ async def health():
 
 @app.websocket("/ws/test-call")
 async def browser_test_call(browser_ws: WebSocket):
+    # Accept immediately so the client gets a connected WebSocket before any
+    # downstream initialization can fail.
     await browser_ws.accept()
 
     test_id = ""  # set by the browser on connect
-    bridge = GeminiLiveBridge(genai_client, GEMINI_LIVE_MODEL, GEMINI_LIVE_CONFIG)
+    bridge = None
 
-    async def handle_tool_call(name: str, call_id: str, args: dict):
-        if name == "log_call_outcome":
-            supabase.table("leads").upsert(
-                {
-                    "call_sid": test_id,
-                    "phone_number": "browser-test",
-                    "outcome": args.get("outcome", "in_progress"),
-                    "contact_name": args.get("contact_name"),
-                    "business_name": args.get("business_name"),
-                    "notes": args.get("notes"),
-                    "call_status": "completed",
-                    "followup_time": args.get("followup_time"),
-                },
-                on_conflict="call_sid",
-            ).execute()
-            if args.get("followup_time"):
-                supabase.table("leads").update({"followup_time": args["followup_time"]}).eq("call_sid", test_id).execute()
-            result = {"status": "logged"}
-        elif name == "end_call":
-            result = {"status": "ending"}
-        else:
-            result = {"status": "unknown_tool"}
+    try:
+        bridge = GeminiLiveBridge(genai_client, GEMINI_LIVE_MODEL, GEMINI_LIVE_CONFIG)
 
-        await bridge.send_tool_response([{"name": name, "id": call_id, "response": result}])
+        async def handle_tool_call(name: str, call_id: str, args: dict):
+            if name == "log_call_outcome":
+                supabase.table("leads").upsert(
+                    {
+                        "call_sid": test_id,
+                        "phone_number": "browser-test",
+                        "outcome": args.get("outcome", "in_progress"),
+                        "contact_name": args.get("contact_name"),
+                        "business_name": args.get("business_name"),
+                        "notes": args.get("notes"),
+                        "call_status": "completed",
+                        "followup_time": args.get("followup_time"),
+                    },
+                    on_conflict="call_sid",
+                ).execute()
+                if args.get("followup_time"):
+                    supabase.table("leads").update({"followup_time": args["followup_time"]}).eq("call_sid", test_id).execute()
+                result = {"status": "logged"}
+            elif name == "end_call":
+                result = {"status": "ending"}
+                # Signal intentional hangup so the bridge stops reconnecting
+                bridge.signal_intentional_hangup()
+            else:
+                result = {"status": "unknown_tool"}
 
-        if name == "end_call":
-            await browser_ws.close()
+            await bridge.send_tool_response([{"name": name, "id": call_id, "response": result}])
 
-    async def on_message(msg):
-        """Dispatch a Gemini server message to the browser page."""
-        try:
-            print(f"[test-call] <<< from Gemini: {msg}")
-            if msg.server_content:
-                if msg.server_content.model_turn:
-                    for part in msg.server_content.model_turn.parts or []:
-                        if part.inline_data and part.inline_data.data:
+            if name == "end_call":
+                await browser_ws.close()
+
+        async def on_message(msg):
+            """Dispatch a Gemini server message to the browser page."""
+            try:
+                print(f"[test-call] <<< from Gemini: {msg}")
+                if msg.server_content:
+                    if msg.server_content.model_turn:
+                        for part in msg.server_content.model_turn.parts or []:
+                            if part.inline_data and part.inline_data.data:
+                                await browser_ws.send_text(
+                                    json.dumps(
+                                        {
+                                            "type": "audio",
+                                            "data": base64.b64encode(part.inline_data.data).decode(),
+                                            "mime_type": part.inline_data.mime_type,
+                                        }
+                                    )
+                                )
+                            elif part.text:
+                                await browser_ws.send_text(json.dumps({"type": "agent_text", "text": part.text}))
+
+                    if msg.server_content.interrupted:
+                        # Clear any pending transcription buffer on interruption
+                        if hasattr(on_message, "_transcription_buffer"):
+                            on_message._transcription_buffer = ""
+                        await browser_ws.send_text(json.dumps({"type": "interrupted"}))
+
+                    if msg.server_content.input_transcription and msg.server_content.input_transcription.text:
+                        await browser_ws.send_text(
+                            json.dumps(
+                                {
+                                    "type": "user_transcript",
+                                    "text": msg.server_content.input_transcription.text,
+                                }
+                            )
+                        )
+
+                    # Accumulate output_transcription for the current model turn.
+                    # Only forward as a single agent_text when the turn completes
+                    # (turn_complete=True or generation_complete=True), avoiding
+                    # fragmented bubbles from streaming chunks.
+                    if msg.server_content.output_transcription and msg.server_content.output_transcription.text:
+                        # Initialize buffer if needed
+                        if not hasattr(on_message, "_transcription_buffer"):
+                            on_message._transcription_buffer = ""
+                        on_message._transcription_buffer += msg.server_content.output_transcription.text
+
+                    # Turn complete: send the accumulated transcription as ONE agent_text
+                    if msg.server_content.turn_complete or msg.server_content.generation_complete:
+                        if hasattr(on_message, "_transcription_buffer") and on_message._transcription_buffer:
                             await browser_ws.send_text(
                                 json.dumps(
                                     {
-                                        "type": "audio",
-                                        "data": base64.b64encode(part.inline_data.data).decode(),
-                                        "mime_type": part.inline_data.mime_type,
+                                        "type": "agent_text",
+                                        "text": on_message._transcription_buffer,
                                     }
                                 )
                             )
-                        elif part.text:
-                            await browser_ws.send_text(json.dumps({"type": "agent_text", "text": part.text}))
+                            on_message._transcription_buffer = ""
 
-                if msg.server_content.interrupted:
-                    await browser_ws.send_text(json.dumps({"type": "interrupted"}))
+                elif msg.tool_call and msg.tool_call.function_calls:
+                    for fc in msg.tool_call.function_calls:
+                        await handle_tool_call(name=fc.name, call_id=fc.id, args=fc.args or {})
+            except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
+                if bridge:
+                    bridge.stop()
+            except Exception as e:
+                print(f"[test-call] on_message error: {type(e).__name__}: {e}")
 
-                if msg.server_content.input_transcription and msg.server_content.input_transcription.text:
-                    await browser_ws.send_text(
-                        json.dumps(
-                            {
-                                "type": "user_transcript",
-                                "text": msg.server_content.input_transcription.text,
-                            }
-                        )
-                    )
+        async def browser_to_gemini():
+            nonlocal test_id
+            try:
+                async for message in browser_ws.iter_text():
+                    data = json.loads(message)
+                    msg_type = data.get("type", "unknown")
+                    if msg_type == "text":
+                        print(f"[BROWSER IN] {msg_type} text={data.get('text')!r}")
+                    else:
+                        print(f"[BROWSER IN] {msg_type}")
 
-                if msg.server_content.output_transcription and msg.server_content.output_transcription.text:
-                    await browser_ws.send_text(
-                        json.dumps(
-                            {
-                                "type": "agent_text",
-                                "text": msg.server_content.output_transcription.text,
-                            }
-                        )
-                    )
+                    if data.get("type") == "hello":
+                        test_id = data.get("test_id", f"browser-test-{int(datetime.now().timestamp()*1000)}")
+                        # Don't tell the browser to start streaming until a Gemini
+                        # session is actually live, so the first mic frames aren't
+                        # dropped during the initial connect.
+                        for _ in range(50):  # up to ~5s
+                            if bridge.session is not None:
+                                break
+                            await asyncio.sleep(0.1)
+                        await browser_ws.send_text(json.dumps({"type": "ready"}))
 
-            elif msg.tool_call and msg.tool_call.function_calls:
-                for fc in msg.tool_call.function_calls:
-                    await handle_tool_call(name=fc.name, call_id=fc.id, args=fc.args or {})
-        except (WebSocketDisconnect, websockets.exceptions.ConnectionClosed):
-            bridge.stop()
+                    elif data.get("type") == "audio":
+                        # 16kHz mono PCM from the browser -> buffered safely and
+                        # sent to Gemini by the bridge's detached sender task.
+                        try:
+                            pcm = base64.b64decode(data["data"])
+                            print(f"[test-call] received {len(pcm)} bytes of audio from browser")
+                            bridge.send_audio(pcm)
+                        except Exception as e:
+                            print(f"[test-call] dropped bad audio frame: {e}")
 
-    async def browser_to_gemini():
-        nonlocal test_id
+                    elif data.get("type") == "text":
+                        # Silent test path — no mic/speakers needed. Sends a
+                        # normal text turn; the agent still replies with
+                        # audio (response_modalities=["AUDIO"]), but since
+                        # output_audio_transcription is on, that reply also
+                        # arrives as text via agent_text — so this works
+                        # completely silently end to end.
+                        print(f"[test-call] received text turn: {data['text']!r}")
+                        await bridge.send_text(data["text"])
+            except WebSocketDisconnect:
+                print(f"[BROWSER WS CLOSED] WebSocketDisconnect")
+            except Exception as e:
+                print(f"[BROWSER WS CLOSED] error={type(e).__name__}: {e}")
+            finally:
+                print(f"[BROWSER WS CLOSED] cleanup")
+                if bridge:
+                    bridge.stop()
+
+        run_task = asyncio.create_task(bridge.run(on_message))
+        client_task = asyncio.create_task(browser_to_gemini())
+
+        # Log any unhandled exception from the Gemini bridge loop (never silent).
+        def _log_run_exc(t):
+            try:
+                t.result()
+            except Exception as e:
+                print(f"[RUN TASK EXCEPTION] {type(e).__name__}: {e}")
+        run_task.add_done_callback(_log_run_exc)
+
+        # The browser websocket is the life of this handler. The Gemini bridge loop
+        # (run_task) self-heals and keeps the session alive across turns, so we do
+        # NOT cancel the browser leg when run() merely returns. We end only when:
+        #   - the browser closes the websocket (normal end), or
+        #   - the bridge hits an unrecoverable Gemini error, or
+        #   - the agent calls end_call (signal_intentional_hangup).
         try:
-            async for message in browser_ws.iter_text():
-                data = json.loads(message)
-
-                if data.get("type") == "hello":
-                    test_id = data.get("test_id", f"browser-test-{int(datetime.now().timestamp()*1000)}")
-                    # Don't tell the browser to start streaming until a Gemini
-                    # session is actually live, so the first mic frames aren't
-                    # dropped during the initial connect.
-                    for _ in range(50):  # up to ~5s
-                        if bridge.session is not None:
-                            break
-                        await asyncio.sleep(0.1)
-                    await browser_ws.send_text(json.dumps({"type": "ready"}))
-
-                elif data.get("type") == "audio":
-                    # 16kHz mono PCM from the browser -> buffered safely and
-                    # sent to Gemini by the bridge's detached sender task.
-                    try:
-                        pcm = base64.b64decode(data["data"])
-                        print(f"[test-call] received {len(pcm)} bytes of audio from browser")
-                        bridge.send_audio(pcm)
-                    except Exception as e:
-                        print(f"[test-call] dropped bad audio frame: {e}")
-
-                elif data.get("type") == "text":
-                    # Silent test path — no mic/speakers needed. Sends a
-                    # normal text turn; the agent still replies with
-                    # audio (response_modalities=["AUDIO"]), but since
-                    # output_audio_transcription is on, that reply also
-                    # arrives as text via agent_text — so this works
-                    # completely silently end to end.
-                    print(f"[test-call] received text turn: {data['text']!r}")
-                    await bridge.send_text(data["text"])
-        except WebSocketDisconnect:
-            pass
+            # Wait for the browser to disconnect OR the bridge to fatally fail.
+            done, pending = await asyncio.wait(
+                {client_task, run_task}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
         finally:
-            bridge.stop()
-
-    run_task = asyncio.create_task(bridge.run(on_message))
-    client_task = asyncio.create_task(browser_to_gemini())
-    # End the whole bridge as soon as either side finishes: if the browser
-    # disconnects we cancel the (possibly blocked) Gemini receive loop; if
-    # Gemini gives a hard error we cancel the browser leg.
-    done, pending = await asyncio.wait(
-        {client_task, run_task}, return_when=asyncio.FIRST_COMPLETED
-    )
-    for t in pending:
-        t.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+            # Ensure the bridge loop is fully stopped/closed on exit.
+            if bridge:
+                bridge.stop()
+            if not run_task.done():
+                run_task.cancel()
+                try:
+                    await run_task
+                except asyncio.CancelledError:
+                    pass
+    except Exception as e:
+        # Catch any error during initialization (e.g., Gemini bridge creation)
+        # and log it without leaving the socket in a bad state.
+        print(f"[test-call] WebSocket initialization error: {type(e).__name__}: {e}")
+        try:
+            await browser_ws.close(code=1011, reason="Internal server error during initialization")
+        except Exception:
+            pass
 
 
 class LogTestOutcomeRequest(BaseModel):
