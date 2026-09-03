@@ -54,13 +54,6 @@ Interruption handling works via Gemini's **server-side voice-activity detection 
 
 ![Elite AI Voice Agent Dashboard](screenshots/dashboard.png)
 
-### Live Conversation
-
-![Elite AI Voice Agent Live Conversation](screenshots/voice-agent.png)
-
-### Captured Leads
-
-![Elite AI Captured Leads](screenshots/leads.png)
 
 ## Running Locally
 
