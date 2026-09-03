@@ -18,9 +18,9 @@ function isRealPhone(n) {
 export default function LeadsPanel({ leads, loading, onRefresh, className = "" }) {
   return (
     <aside className={`glass flex min-h-0 flex-col rounded-2xl ${className}`}>
-      <div className="flex items-center justify-between border-b border-purple-500/15 px-5 py-4">
+      <div className="flex items-center justify-between border-b border-cyan-500/15 px-5 py-4">
         <div>
-          <h2 className="text-sm font-semibold text-zinc-100">Captured Leads</h2>
+          <h2 className="text-sm font-semibold text-zinc-100">Lead Details</h2>
           <p className="text-[11px] text-zinc-500">Supabase realtime · live updates</p>
         </div>
         <button
@@ -28,9 +28,9 @@ export default function LeadsPanel({ leads, loading, onRefresh, className = "" }
           disabled={loading}
           aria-label="Refresh leads"
           title="Refresh leads"
-          className="flex h-9 w-9 items-center justify-center rounded-full border border-purple-500/25 bg-purple-500/10 text-purple-300 transition hover:bg-purple-500/20 disabled:opacity-50"
+          className="flex h-9 w-9 items-center justify-center rounded-full border border-cyan-500/25 bg-cyan-500/10 text-cyan-300 transition hover:bg-cyan-500/20 disabled:opacity-50"
         >
-          <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin text-purple-200" : ""}`} />
+          <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin text-cyan-200" : ""}`} />
         </button>
       </div>
 
@@ -39,7 +39,7 @@ export default function LeadsPanel({ leads, loading, onRefresh, className = "" }
           <div className="flex flex-col items-center gap-2 py-10 text-center">
             <User className="h-8 w-8 text-zinc-600" />
             <p className="text-sm text-zinc-500">No leads captured yet.</p>
-            <p className="text-xs text-zinc-600">Trigger a call or use the harness to log your first one.</p>
+            <p className="text-xs text-zinc-600">Start a call to log your first lead.</p>
           </div>
         )}
 
@@ -55,10 +55,10 @@ export default function LeadsPanel({ leads, loading, onRefresh, className = "" }
           const live = lead.outcome === "in_progress";
           const name = lead.business_name || lead.contact_name || "—";
           return (
-            <article key={lead.id} className="lead-hover rounded-xl border border-purple-500/15 bg-zinc-950/50 p-3.5">
+            <article key={lead.id} className="lead-hover rounded-xl border border-cyan-500/15 bg-zinc-950/50 p-3.5">
               <div className="flex items-start justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2">
-                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-purple-500/30 bg-purple-500/15 text-purple-300">
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-cyan-500/30 bg-cyan-500/15 text-cyan-300">
                     <User className="h-3.5 w-3.5" />
                   </span>
                   <div className="min-w-0">
@@ -85,7 +85,7 @@ export default function LeadsPanel({ leads, loading, onRefresh, className = "" }
                   )}
                   {lead.notes && (
                     <p className="line-clamp-3 leading-relaxed text-zinc-400">
-                      <span className="mr-1 font-semibold text-purple-300">Learned:</span>
+                      <span className="mr-1 font-semibold text-cyan-300">Learned:</span>
                       {lead.notes}
                     </p>
                   )}
@@ -111,8 +111,8 @@ export default function LeadsPanel({ leads, loading, onRefresh, className = "" }
         })}
       </div>
 
-      <div className="flex items-center gap-2 border-t border-purple-500/15 px-5 py-3 text-[11px] text-zinc-500">
-        <Bot className="h-3.5 w-3.5 text-purple-400" />
+      <div className="flex items-center gap-2 border-t border-cyan-500/15 px-5 py-3 text-[11px] text-zinc-500">
+        <Bot className="h-3.5 w-3.5 text-cyan-400" />
         Outcomes stream live from tool calls + Twilio callbacks
       </div>
     </aside>

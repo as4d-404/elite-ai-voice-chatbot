@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import {
-  Sparkles,
   Activity,
   ListFilter,
   MessageSquare,
@@ -12,18 +11,25 @@ import {
   CheckCircle2,
   Loader2,
   ShieldAlert,
+  Sparkles,
+  Mic,
+  MicOff,
+  Phone,
+  Send,
+  StopCircle,
 } from "lucide-react";
 import { supabase } from "../lib/supabase";
 import LiveHarness from "../components/LiveHarness";
 import LeadsPanel from "../components/LeadsPanel";
+import Image from "next/image";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "";
 
 const NAV = [
-  { id: "harness", label: "Live Call Harness", icon: Activity },
+  { id: "voice", label: "Voice Agent", icon: Mic },
   { id: "leads", label: "Captured Leads", icon: ListFilter },
-  { id: "logs", label: "Call Logs & Transcripts", icon: MessageSquare },
-  { id: "settings", label: "System Settings", icon: Settings },
+  { id: "history", label: "Call History", icon: MessageSquare },
+  { id: "settings", label: "Settings", icon: Settings },
 ];
 
 const OUTCOME_DOT = {
@@ -36,7 +42,7 @@ const OUTCOME_DOT = {
 };
 
 export default function CommandCenter() {
-  const [view, setView] = useState("harness");
+  const [view, setView] = useState("voice");
   const [leads, setLeads] = useState([]);
   const [leadsLoading, setLeadsLoading] = useState(true);
   const [backend, setBackend] = useState("checking");
@@ -88,22 +94,22 @@ export default function CommandCenter() {
   };
 
   return (
-    <div className="aura-bg relative min-h-screen p-4 lg:p-5">
-      <div className="mx-auto flex max-w-[1760px] flex-col gap-4 lg:flex-row lg:items-stretch">
+    <div className="aura-bg min-h-screen">
+      <div className="flex h-screen lg:flex-row">
         <Sidebar view={view} setView={setView} backend={backend} liveState={liveState} />
 
-        <main className="flex min-w-0 flex-1 flex-col gap-4">
-          {view === "harness" && <LiveHarness onCallStateChange={handleLiveState} />}
+        <main className="flex-1 flex flex-col min-h-0 overflow-hidden">
+          {view === "voice" && <LiveHarness onCallStateChange={handleLiveState} />}
           {view === "leads" && (
             <LeadsPanel leads={leads} loading={leadsLoading} onRefresh={fetchLeads} className="h-full" />
           )}
-          {view === "logs" && <TranscriptsView leads={leads} loading={leadsLoading} onRefresh={fetchLeads} />}
+          {view === "history" && <TranscriptsView leads={leads} loading={leadsLoading} onRefresh={fetchLeads} />}
           {view === "settings" && <SettingsView backend={backend} />}
         </main>
 
-        <div className="h-[540px] lg:h-auto lg:w-[400px] lg:shrink-0">
+        <aside className="hidden lg:block w-[380px] shrink-0">
           <LeadsPanel leads={leads} loading={leadsLoading} onRefresh={fetchLeads} className="h-full" />
-        </div>
+        </aside>
       </div>
     </div>
   );
@@ -111,16 +117,24 @@ export default function CommandCenter() {
 
 function Sidebar({ view, setView, backend, liveState }) {
   return (
-    <header className="glass flex flex-col gap-2 lg:w-64 lg:shrink-0">
-      <div className="flex items-center gap-2 px-5 pt-5">
-        <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-purple-500/40 bg-purple-500/20 shadow-[0_0_18px_rgba(168,85,247,0.45)]">
-          <Sparkles className="h-4.5 w-4.5 text-purple-300" />
-        </span>
-        <span className="text-xl font-extrabold tracking-[0.18em] text-aura">AIAURA</span>
+    <aside className="glass flex flex-col h-screen w-64 shrink-0 border-r border-cyan-500/15">
+      <div className="flex items-center gap-3 px-5 pt-5">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-cyan-500/10">
+          <Image
+            src="/elite-ai-logo.svg"
+            alt="Elite AI"
+            width={42}
+            height={42}
+            className="h-10 w-10 object-contain"
+          />
+        </div>
+        <div className="flex flex-col">
+          <span className="text-xl font-extrabold tracking-[0.18em] text-elite">Elite AI</span>
+          <span className="text-[11px] text-zinc-500">Voice Agent</span>
+        </div>
       </div>
-      <div className="px-5 pb-4 text-[11px] text-zinc-500">Elite AI · Outbound Voice Agent</div>
 
-      <nav className="flex gap-1.5 overflow-x-auto px-3 lg:flex-col lg:overflow-visible">
+      <nav className="flex flex-col gap-1.5 px-3">
         {NAV.map((item) => {
           const Icon = item.icon;
           const active = view === item.id;
@@ -129,14 +143,14 @@ function Sidebar({ view, setView, backend, liveState }) {
               key={item.id}
               onClick={() => setView(item.id)}
               aria-current={active ? "page" : undefined}
-              className={`relative flex shrink-0 items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-sm font-medium transition lg:w-full ${
+              className={`relative flex shrink-0 items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-sm font-medium transition w-full ${
                 active
-                  ? "border border-purple-500/40 bg-purple-500/15 text-purple-200 shadow-[0_0_16px_rgba(168,85,247,0.25)]"
+                  ? "border border-cyan-500/40 bg-cyan-500/15 text-cyan-200 shadow-[0_0_16px_rgba(6,182,212,0.25)]"
                   : "border border-transparent text-zinc-400 hover:bg-zinc-900/60 hover:text-zinc-200"
               }`}
             >
               {active && (
-                <span className="absolute left-0 top-1/2 h-6 w-0.5 -translate-y-1/2 rounded-full bg-gradient-to-b from-purple-300 to-purple-600 lg:left-auto lg:right-1" />
+                <span className="absolute left-0 top-1/2 h-6 w-0.5 -translate-y-1/2 rounded-full bg-gradient-to-b from-cyan-300 to-cyan-600" />
               )}
               <Icon className="h-4 w-4 shrink-0" />
               <span className="whitespace-nowrap">{item.label}</span>
@@ -148,7 +162,7 @@ function Sidebar({ view, setView, backend, liveState }) {
         })}
       </nav>
 
-      <div className="mt-auto border-t border-purple-500/15 px-5 py-4">
+      <div className="mt-auto border-t border-cyan-500/15 px-5 py-4">
         <div className="flex items-center gap-2">
           <span className={`h-2 w-2 rounded-full ${backend === "up" ? "bg-emerald-400 pulse-dot text-emerald-400" : backend === "down" ? "bg-rose-500" : "bg-zinc-500 animate-pulse"}`} />
           <span className="text-xs font-medium text-zinc-300">FastAPI + Gemini Live:</span>
@@ -161,7 +175,7 @@ function Sidebar({ view, setView, backend, liveState }) {
           Supabase realtime · live
         </div>
       </div>
-    </header>
+    </aside>
   );
 }
 
@@ -171,9 +185,9 @@ function TranscriptsView({ leads, loading, onRefresh }) {
   const ended = leads.length - live;
   return (
     <div className="glass flex min-h-0 flex-1 flex-col rounded-2xl">
-      <div className="flex items-center justify-between border-b border-purple-500/15 px-5 py-4">
+      <div className="flex items-center justify-between border-b border-cyan-500/15 px-5 py-4">
         <div>
-          <h2 className="text-sm font-semibold text-zinc-100">Call Logs &amp; Transcripts</h2>
+          <h2 className="text-sm font-semibold text-zinc-100">Call History</h2>
           <p className="text-[11px] text-zinc-500">
             {leads.length} calls · {live} live · {booked} booked · {ended} ended
           </p>
@@ -181,7 +195,7 @@ function TranscriptsView({ leads, loading, onRefresh }) {
         <button
           onClick={onRefresh}
           aria-label="Refresh logs"
-          className="flex h-9 items-center gap-2 rounded-full border border-purple-500/25 bg-purple-500/10 px-3 text-xs text-purple-300 transition hover:bg-purple-500/20"
+          className="flex h-9 items-center gap-2 rounded-full border border-cyan-500/25 bg-cyan-500/10 px-3 text-xs text-cyan-300 transition hover:bg-cyan-500/20"
         >
           <span className={`${loading ? "animate-spin" : ""}`}>⟳</span> Refresh
         </button>
@@ -197,9 +211,9 @@ function TranscriptsView({ leads, loading, onRefresh }) {
           <div className="py-16 text-center text-sm text-zinc-500">No call logs yet.</div>
         )}
         {leads.map((lead) => (
-          <article key={lead.id} className="lead-hover rounded-xl border border-purple-500/15 bg-zinc-950/50 p-4">
+          <article key={lead.id} className="lead-hover rounded-xl border border-cyan-500/15 bg-zinc-950/50 p-4">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-              <span className="flex h-7 w-7 items-center justify-center rounded-full border border-purple-500/30 bg-purple-500/15 text-purple-300">
+              <span className="flex h-7 w-7 items-center justify-center rounded-full border border-cyan-500/30 bg-cyan-500/15 text-cyan-300">
                 <User className="h-3.5 w-3.5" />
               </span>
               <span className="text-sm font-medium text-zinc-100">
@@ -216,7 +230,7 @@ function TranscriptsView({ leads, loading, onRefresh }) {
             <div className="mt-3 space-y-1.5 text-xs text-zinc-400">
               {lead.notes && (
                 <p className="leading-relaxed">
-                  <span className="font-semibold text-purple-300">Summary:</span> {lead.notes}
+                  <span className="font-semibold text-cyan-300">Summary:</span> {lead.notes}
                 </p>
               )}
               {lead.transcript ? (
@@ -254,7 +268,7 @@ function SettingsView({ backend }) {
   return (
     <div className="glass flex min-h-0 flex-1 flex-col rounded-2xl p-5">
       <div>
-        <h2 className="text-sm font-semibold text-zinc-100">System Settings</h2>
+        <h2 className="text-sm font-semibold text-zinc-100">Settings</h2>
         <p className="text-[11px] text-zinc-500">Read-only status from the running environment.</p>
       </div>
 
@@ -262,7 +276,7 @@ function SettingsView({ backend }) {
         {items.map((it) => (
           <div key={it.k} className="flex items-center justify-between gap-3 rounded-lg border border-zinc-800/80 bg-zinc-950/50 px-4 py-3">
             <span className="text-sm text-zinc-300">{it.k}</span>
-            <span className={`max-w-[55%] truncate font-mono text-xs ${it.ok ? "text-purple-300" : "text-zinc-600"}`}>
+            <span className={`max-w-[55%] truncate font-mono text-xs ${it.ok ? "text-cyan-300" : "text-zinc-600"}`}>
               {it.v}
             </span>
           </div>
@@ -276,8 +290,8 @@ function SettingsView({ backend }) {
         </div>
       </div>
 
-      <div className="mt-5 flex items-start gap-2 rounded-lg border border-purple-500/20 bg-purple-500/5 px-4 py-3 text-xs text-zinc-400">
-        <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-purple-300" />
+      <div className="mt-5 flex items-start gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-xs text-zinc-400">
+        <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-cyan-300" />
         <p>
           Do-not-call is honored in-call: the agent apologizes and logs{" "}
           <span className="text-rose-300">do_not_call</span> immediately. Phone numbers are validated as
@@ -285,11 +299,11 @@ function SettingsView({ backend }) {
         </p>
       </div>
 
-      <div className="mt-5 flex items-start gap-2 rounded-lg border border-purple-500/20 bg-purple-500/5 px-4 py-3 text-xs text-zinc-400">
-        <Bot className="mt-0.5 h-4 w-4 shrink-0 text-purple-300" />
+      <div className="mt-5 flex items-start gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-xs text-zinc-400">
+        <Bot className="mt-0.5 h-4 w-4 shrink-0 text-cyan-300" />
         <p>
-          Voice layer runs on <span className="text-purple-300">Gemini Live</span> (Google AI Studio). OpenAI
-          Agents SDK &amp; Claude Agent SDK clients are initialized in the backend for agent-logic paths.
+          Voice layer runs on <span className="text-cyan-300">Gemini Live</span> (Google AI Studio). OpenAI
+          Agents SDK & Claude Agent SDK clients are initialized in the backend for agent-logic paths.
           Telephony callbacks and outcome logging are handled by FastAPI + Supabase.
         </p>
       </div>

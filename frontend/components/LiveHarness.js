@@ -8,6 +8,7 @@ import {
   Send,
   Loader2,
   StopCircle,
+  X,
 } from "lucide-react";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL;
@@ -16,14 +17,14 @@ const E164 = /^\+[1-9]\d{6,14}$/;
 
 const STATUS_META = {
   idle: {
-    label: "Idle",
+    label: "Ready",
     pill: "border-zinc-500/30 bg-zinc-500/10 text-zinc-400",
     dot: "bg-zinc-500",
   },
   connecting: {
-    label: "Connecting...",
-    pill: "border-purple-500/40 bg-purple-500/10 text-purple-300",
-    dot: "bg-purple-400 animate-pulse",
+    label: "Connecting…",
+    pill: "border-cyan-500/40 bg-cyan-500/10 text-cyan-300",
+    dot: "bg-cyan-400 animate-pulse",
   },
   live: {
     label: "Live Call in Progress",
@@ -44,7 +45,7 @@ const now = () =>
 
 export default function LiveHarness({ onCallStateChange }) {
   const [status, setStatus] = useState("idle");
-  const [prospectName, setProspectName] = useState("Jordan");
+  const [prospectName, setProspectName] = useState("");
   const [phoneNumber, setPhoneNumber] = useState("");
   const [bubbles, setBubbles] = useState([]);
   const [muted, setMuted] = useState(false);
@@ -255,7 +256,7 @@ export default function LiveHarness({ onCallStateChange }) {
     setStatusNow("connecting");
     setBubbles([]);
     testIdRef.current = `browser-test-${Date.now()}`;
-    appendBubble("system", "Opening audio harness…");
+    appendBubble("system", "Starting voice session…");
 
     try {
       const micStream = await navigator.mediaDevices.getUserMedia({
@@ -371,20 +372,20 @@ export default function LiveHarness({ onCallStateChange }) {
   const meta = STATUS_META[status] || STATUS_META.idle;
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-4">
-      <header className="glass-strong flex flex-col gap-3 rounded-2xl px-5 py-4 lg:flex-row lg:items-center lg:justify-between">
+    <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
+      <header className="glass flex flex-col gap-3 rounded-2xl px-5 py-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex items-center gap-3">
-          <Bot className="h-6 w-6 text-purple-400" />
+          <Bot className="h-6 w-6 text-cyan-400" />
           <div>
             <div className="text-sm font-semibold text-zinc-100">
-              Lead: <span className="text-aura">{prospectName || "Unnamed prospect"}</span>
+              Prospect: <span className="text-cyan-300">{prospectName || "Prospect"}</span>
             </div>
-            <div className="text-xs text-zinc-500">Home Service Pro · outbound desk</div>
+            <div className="text-xs text-zinc-500">Elite AI Voice Agent · outbound sales</div>
           </div>
         </div>
         <div className="flex items-center gap-3">
           {outbound ? (
-            <span className="rounded-full border border-purple-500/30 bg-purple-500/10 px-3 py-1 text-xs text-purple-300">
+            <span className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-1 text-xs text-cyan-300">
               Twilio dialing {outbound.phone}
             </span>
           ) : null}
@@ -399,15 +400,13 @@ export default function LiveHarness({ onCallStateChange }) {
         </div>
       </header>
 
-      <section className="glass-strong flex min-h-0 flex-1 flex-col rounded-2xl">
+      <section className="glass flex min-h-0 flex-1 flex-col rounded-2xl overflow-hidden">
         <div ref={scrollRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
           {bubbles.length === 0 && (
             <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
-              <Bot className="h-12 w-12 text-purple-500/50" />
+              <Bot className="h-12 w-12 text-cyan-500/50" />
               <p className="max-w-sm text-sm text-zinc-500">
-                Quiet on the line. Press{" "}
-                <span className="font-medium text-purple-300">Start Outbound Call</span> to open a live
-                session — or type a reply below to test silently.
+                Start a call to begin the conversation.
               </p>
             </div>
           )}
@@ -432,7 +431,7 @@ export default function LiveHarness({ onCallStateChange }) {
                 <div
                   className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full border ${
                     isAgent
-                      ? "border-purple-500/40 bg-purple-500/20 text-purple-300"
+                      ? "border-cyan-500/40 bg-cyan-500/20 text-cyan-300"
                       : "border-indigo-500/40 bg-indigo-500/20 text-indigo-300"
                   }`}
                 >
@@ -441,14 +440,14 @@ export default function LiveHarness({ onCallStateChange }) {
                 <div
                   className={`max-w-[78%] rounded-2xl px-4 py-3 ${
                     isAgent
-                      ? "border border-purple-500/25 bg-zinc-900/90 text-zinc-100"
-                      : "bg-gradient-to-br from-purple-600/85 to-indigo-600/85 text-white"
+                      ? "border border-cyan-500/25 bg-zinc-900/90 text-zinc-100"
+                      : "bg-gradient-to-br from-indigo-600/85 to-blue-600/85 text-white"
                   }`}
                 >
                   {isAgent && (
                     <div className="mb-1 flex items-center justify-between gap-3">
-                      <span className="text-[11px] font-semibold uppercase tracking-wide text-purple-300">
-                        Jordan · AI
+                      <span className="text-[11px] font-semibold uppercase tracking-wide text-cyan-300">
+                        Jordan · Elite AI
                       </span>
                       <span className="text-[10px] tabular-nums text-zinc-500">{b.time}</span>
                     </div>
@@ -461,62 +460,35 @@ export default function LiveHarness({ onCallStateChange }) {
 
           {agentSpeaking && (
             <div className="bubble-in flex items-center gap-3">
-              <div className="flex h-8 w-8 items-center justify-center rounded-full border border-purple-500/40 bg-purple-500/20 text-purple-300">
+              <div className="flex h-8 w-8 items-center justify-center rounded-full border border-cyan-500/40 bg-cyan-500/20 text-cyan-300">
                 <Bot className="h-4 w-4" />
               </div>
-              <div className="flex items-center gap-2 rounded-full border border-purple-500/25 bg-zinc-900/90 px-4 py-2">
+              <div className="flex items-center gap-2 rounded-full border border-cyan-500/25 bg-zinc-900/90 px-4 py-2">
                 <span className="speak-dots">
                   <span />
                   <span />
                   <span />
                 </span>
-                <span className="text-xs text-purple-300">Jordan speaking…</span>
+                <span className="text-xs text-cyan-300">Jordan speaking…</span>
               </div>
             </div>
           )}
         </div>
 
-        <div className="border-t border-purple-500/15 p-3">
-          <div className="flex gap-2">
+        <div className="border-t border-cyan-500/15 p-4 space-y-4">
+          <div className="grid gap-3 sm:grid-cols-2">
             <input
-              value={textInput}
-              onChange={(e) => setTextInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleSendText()}
-              placeholder={
-                status === "live"
-                  ? "Type what you'd say and press Enter (or use the mic)…"
-                  : "Start the call first, or send a silent text turn…"
-              }
-              className="min-w-0 flex-1 rounded-full border border-zinc-700/60 bg-zinc-900/70 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-purple-500/60"
-            />
-            <button
-              onClick={handleSendText}
-              aria-label="Send text turn"
-              className="flex items-center justify-center rounded-full border border-purple-500/30 bg-purple-500/10 px-4 text-purple-300 transition hover:bg-purple-500/20"
-            >
-              <Send className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-      </section>
-
-      <footer className="glass-strong rounded-2xl px-5 py-4">
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="flex min-w-[220px] flex-1 flex-col gap-2 sm:flex-row sm:items-center">
-            <input
-              aria-label="Prospect name"
               value={prospectName}
               onChange={(e) => setProspectName(e.target.value)}
-              placeholder="Prospect name (e.g. Jordan's Plumbing)"
-              className="min-w-0 flex-1 rounded-lg border border-zinc-700/60 bg-zinc-900/70 px-3 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-purple-500/60"
+              placeholder="Prospect name"
+              className="rounded-lg border border-zinc-700/60 bg-zinc-900/70 px-3 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-cyan-500/60"
             />
             <input
-              aria-label="Phone number to call"
               value={phoneNumber}
               onChange={(e) => setPhoneNumber(e.target.value)}
               placeholder="+15551234567"
               inputMode="tel"
-              className="min-w-0 flex-1 rounded-lg border border-zinc-700/60 bg-zinc-900/70 px-3 py-2.5 font-mono text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-purple-500/60"
+              className="rounded-lg border border-zinc-700/60 bg-zinc-900/70 px-3 py-2.5 font-mono text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-cyan-500/60"
             />
           </div>
 
@@ -535,7 +507,7 @@ export default function LiveHarness({ onCallStateChange }) {
               className={`flex h-11 w-11 items-center justify-center rounded-full border transition ${
                 muted
                   ? "border-rose-500/50 bg-rose-500/15 text-rose-300"
-                  : "border-zinc-600/60 bg-zinc-900/70 text-zinc-300 hover:border-purple-500/50"
+                  : "border-zinc-600/60 bg-zinc-900/70 text-zinc-300 hover:border-cyan-500/50"
               } ${status !== "live" ? "cursor-not-allowed opacity-40" : ""}`}
             >
               {muted ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
@@ -566,14 +538,13 @@ export default function LiveHarness({ onCallStateChange }) {
           </div>
         </div>
 
-        {error && <p className="mt-3 text-xs text-rose-400">{error}</p>}
+        {error && <p className="mx-4 mt-2 text-xs text-rose-400">{error}</p>}
         {!phoneNumber.trim() && (
-          <p className="mt-2 text-[11px] text-zinc-500">
-            No phone entered — opens the browser audio harness (same agent, no Twilio). Enter an E.164
-            number to also dial it for real.
+          <p className="mx-4 mt-2 text-[11px] text-zinc-500">
+            Leave phone blank for browser voice test · enter E.164 number for Twilio call
           </p>
         )}
-      </footer>
+      </section>
     </div>
   );
 }

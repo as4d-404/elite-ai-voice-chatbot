@@ -15,6 +15,7 @@ __pycache__/
 
 # Database dump
 *.sql
+!supabase/schema.sql
 
 # OS
 .DS_Storenode_modules/
