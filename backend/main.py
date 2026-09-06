@@ -1,33 +1,5 @@
-"""
-AIAURA outbound sales voice agent — backend.
-
-Flow:
-  1. Dashboard calls POST /calls/trigger with a phone number.
-  2. We create a Twilio outbound call, pointing Twilio at /twiml/voice.
-  3. Twilio requests /twiml/voice -> we return TwiML that opens a media
-     stream websocket back to us (/media-stream).
-  4. Twilio connects to /media-stream and streams the call's audio to us in
-     real time (8kHz mulaw, base64-encoded chunks).
-  5. We transcode that audio (8kHz mulaw -> 16kHz PCM) and forward it to the
-     Google Gemini Live API over a WebSocket (via the google-genai SDK), then
-     transcode Gemini's 24kHz PCM reply back to 8kHz mulaw for Twilio.
-  6. Gemini's server-side VAD detects when the caller starts speaking and, by
-     default (`START_OF_ACTIVITY_INTERRUPTS` / "barge-in"), immediately cuts
-     off the model's in-flight response. It signals this with
-     `server_content.interrupted` — on that event we tell Twilio to clear its
-     playback buffer. That's what makes the agent "stop the instant you speak."
-  7. When the model decides the call outcome, it calls the `log_call_outcome`
-     tool, which we handle by writing a row to Supabase (leads table) that
-     the dashboard is subscribed to in real time.
-
-The browser test-call page (`/ws/test-call`) relays your mic directly to the
-same Gemini Live session through this backend, so the agent logic, tools, and
-Supabase logging are identical to the Twilio path — just with your microphone
-instead of a phone line (no Twilio account needed for that part).
-
-Run:
-    uvicorn main:app --reload --port 8000
-And separately: ngrok http 8000  (Twilio needs a public HTTPS/WSS URL)
+"""Elite AI backend: active browser chat, Whisper STT, and TTS use Groq REST.
+Legacy telephony / Gemini bridges remain for compatibility, unused by the UI.
 """
 
 import asyncio
@@ -35,15 +7,18 @@ import base64
 import json
 import os
 import re
+import struct
 from datetime import datetime, timezone
+from typing import Dict, List
 
 import websockets.exceptions
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from google import genai
 from google.genai import errors, types
+from openai import OpenAI
 from pydantic import BaseModel
 from supabase import create_client
 from twilio.rest import Client as TwilioClient
@@ -60,8 +35,8 @@ load_dotenv()
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
-PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
-GOOGLE_AI_STUDIO_API_KEY = os.environ["GOOGLE_AI_STUDIO_API_KEY"]
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+GOOGLE_AI_STUDIO_API_KEY = os.environ.get("GOOGLE_AI_STUDIO_API_KEY", "")
 GEMINI_LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-live-2.5-flash-preview")
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -101,7 +76,7 @@ if not IS_TWILIO_MOCK_MODE:
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # Gemini Live client. Uses the free Google AI Studio API key (no billing).
-genai_client = genai.Client(api_key=GOOGLE_AI_STUDIO_API_KEY)
+genai_client = genai.Client(api_key=GOOGLE_AI_STUDIO_API_KEY) if GOOGLE_AI_STUDIO_API_KEY else None
 
 # OpenAI Agents SDK client — optional; the Gemini Live voice path below is
 # the primary agent runtime and must never be blocked by these imports.
@@ -120,10 +95,28 @@ try:
 except Exception as e:
     print(f"[warn] Claude SDK unavailable (agent compliance path optional): {e}")
 
+# Groq client for text chat (OpenAI-compatible endpoint)
+groq_client = None
+try:
+    groq_client = OpenAI(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=os.environ.get("GROQ_API_KEY", "")
+    )
+    print("[Groq] Client initialized successfully")
+except Exception as e:
+    print(f"[warn] Groq client unavailable: {e}")
+
+# Groq model to use (currently supported)
+GROQ_CHAT_MODEL = os.environ.get("GROQ_CHAT_MODEL", "openai/gpt-oss-120b")
+
+# In-memory conversation store: session_id -> list of messages
+# Each message is a dict with "role" and "content" keys
+conversation_store: Dict[str, List[Dict[str, str]]] = {}
+
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
+    allow_origins=[origin.strip() for origin in os.environ.get("ALLOWED_ORIGINS", "").split(",") if origin.strip()] + [
         "http://localhost",
         "http://localhost:3000",
         "http://127.0.0.1",
@@ -245,7 +238,336 @@ class TriggerCallRequest(BaseModel):
     phone_number: str  # E.164 format, e.g. +15551234567
 
 
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
+
+
+class ChatResponse(BaseModel):
+    session_id: str
+    reply: str
+
+
+class StartSessionRequest(BaseModel):
+    session_id: str
+
+
+class SpeakRequest(BaseModel):
+    text: str
+
+
+class EndSessionRequest(BaseModel):
+    session_id: str
+
+
+class EndSessionResponse(BaseModel):
+    session_id: str
+    outcome: str
+    business_name: str | None
+    contact_name: str | None
+    phone_number: str | None
+    notes: str
+    followup_time: str | None
+    transcript: str
+
+
+class ResetRequest(BaseModel):
+    session_id: str
+
+
+class ResetResponse(BaseModel):
+    session_id: str
+    status: str
+
+
 E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+
+
+def clean_assistant_text(text: str) -> str:
+    """Remove only known internal call artifacts; preserve ordinary prose."""
+    text = re.sub(r"\*+Calling\s+(?:log_call_outcome|log\b|end_call)[^\n]*?\*+", "", text, flags=re.I)
+    text = re.sub(r"\b(?:log_call_outcome|end_call)\s*\([^()]*\)\s*;?", "", text)
+    return text.strip()
+
+
+@app.post("/api/chat/start", response_model=ChatResponse)
+async def start_chat(req: StartSessionRequest):
+    """Seed the outbound opening once, without inventing a prospect turn."""
+    if not req.session_id.strip():
+        raise HTTPException(status_code=400, detail="Session ID cannot be empty")
+    opening = "Hey, this is Maya with Elite AI. Did I catch you at a bad time?"
+    history = conversation_store.setdefault(
+        req.session_id, [{"role": "system", "content": SYSTEM_PROMPT}]
+    )
+    if not any(message["role"] != "system" for message in history):
+        history.append({"role": "assistant", "content": opening})
+    # Retries return the same opening; an existing typed conversation is not restarted.
+    has_opening = any(
+        message["role"] == "assistant" and message["content"] == opening
+        for message in history
+    )
+    return ChatResponse(session_id=req.session_id, reply=opening if has_opening else "")
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    """Text-only multi-turn chat with Groq (Maya persona)."""
+    if groq_client is None:
+        raise HTTPException(status_code=503, detail="Groq client not available")
+
+    session_id = req.session_id
+    user_message = req.message.strip()
+
+    if not user_message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    # Get or create conversation history for this session
+    if session_id not in conversation_store:
+        conversation_store[session_id] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+
+    history = conversation_store[session_id]
+
+    # Add user message to history
+    history.append({"role": "user", "content": user_message})
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model=GROQ_CHAT_MODEL,
+            messages=history,
+            temperature=0.7,
+            max_tokens=250,
+        )
+
+        message = completion.choices[0].message
+        reply = clean_assistant_text(message.content or "")
+
+        # Fallback if model returned empty
+        if not reply:
+            reply = "I'm here to help. What would you like to know about Elite AI?"
+
+        # Add assistant reply to history
+        history.append({"role": "assistant", "content": reply})
+
+        return ChatResponse(session_id=session_id, reply=reply)
+
+    except Exception as e:
+        print(f"[chat] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Groq API error: {e}")
+
+
+@app.post("/api/chat/reset", response_model=ResetResponse)
+async def chat_reset(req: ResetRequest):
+    """Clear conversation history for a session."""
+    session_id = req.session_id
+
+    if session_id in conversation_store:
+        del conversation_store[session_id]
+
+    return ResetResponse(session_id=session_id, status="cleared")
+
+
+@app.get("/api/chat/sessions")
+async def list_sessions():
+    """List active conversation sessions (for debugging)."""
+    return {
+        "sessions": [
+            {"session_id": sid, "turns": len(history) // 2}
+            for sid, history in conversation_store.items()
+        ]
+    }
+
+
+@app.post("/api/chat/end", response_model=EndSessionResponse)
+async def end_session(req: EndSessionRequest):
+    """Analyze conversation, extract lead info, save to Supabase."""
+    session_id = req.session_id
+
+    if session_id not in conversation_store:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    history = conversation_store[session_id]
+
+    # Build transcript from conversation history (skip system prompt)
+    transcript_lines = []
+    for msg in history:
+        if msg["role"] == "user":
+            transcript_lines.append(f"Prospect: {msg['content']}")
+        elif msg["role"] == "assistant":
+            transcript_lines.append(f"Maya: {clean_assistant_text(msg['content'])}")
+    transcript = "\n".join(transcript_lines)
+
+    # Use Groq to analyze and extract structured lead info
+    extraction_prompt = f"""
+You are an analyst extracting lead information from a sales call transcript.
+Analyze the conversation below and return ONLY valid JSON with these exact fields:
+- outcome: one of [booked, callback, not_interested, do_not_call, voicemail, in_progress]
+- business_name: string or null
+- contact_name: string or null
+- phone_number: string or null
+- notes: string (what the agent learned, max 200 chars)
+- followup_time: ISO 8601 datetime string or null
+
+Outcome rules:
+- booked: prospect explicitly agrees to demo/meeting/follow-up time
+- callback: prospect wants to be contacted later or asks for information
+- not_interested: clearly declines
+- do_not_call takes priority over every other outcome when removal is requested
+- do_not_call: explicitly asks to stop calling / remove them / do not contact
+- voicemail: only if session represents voicemail
+- in_progress: conversation ended without a clear final outcome
+
+Do NOT hallucinate. Use null for unknown values.
+
+TRANSCRIPT:
+{transcript}
+"""
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model=GROQ_CHAT_MODEL,
+            messages=[{"role": "user", "content": extraction_prompt}],
+            temperature=0.1,
+            max_tokens=1500,
+            response_format={"type": "json_object"},
+        )
+        extracted = json.loads(completion.choices[0].message.content or "{}")
+    except Exception as e:
+        print(f"[end_session] Extraction failed: {e}")
+        raise HTTPException(status_code=502, detail="Session could not be classified. Please retry.") from e
+
+    if not isinstance(extracted, dict):
+        extracted = {}
+    for field in ("business_name", "contact_name", "phone_number", "followup_time"):
+        value = extracted.get(field)
+        extracted[field] = value.strip() if isinstance(value, str) and value.strip() else None
+    # A single explicitly supplied E.164 number is evidence, not an inferred field.
+    user_text = "\n".join(msg["content"] for msg in history if msg["role"] == "user")
+    explicit_phones = set(re.findall(r"(?<![\w+])\+[1-9]\d{6,14}(?!\d)", user_text))
+    if not extracted["phone_number"] and len(explicit_phones) == 1:
+        extracted["phone_number"] = next(iter(explicit_phones))
+    if extracted["followup_time"]:
+        try:
+            parsed = datetime.fromisoformat(extracted["followup_time"].replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                extracted["followup_time"] = None
+        except ValueError:
+            extracted["followup_time"] = None
+    extracted["notes"] = str(extracted.get("notes") or "")[:200]
+
+    # Prepare Supabase row
+    outcome = extracted.get("outcome", "in_progress")
+    if outcome not in ["booked", "callback", "not_interested", "do_not_call", "voicemail", "in_progress"]:
+        outcome = "in_progress"
+
+    row = {
+        "call_sid": session_id,
+        "phone_number": extracted.get("phone_number"),
+        "business_name": extracted.get("business_name"),
+        "contact_name": extracted.get("contact_name"),
+        "outcome": outcome,
+        "notes": extracted.get("notes"),
+        "followup_time": extracted.get("followup_time"),
+        "transcript": transcript,
+    }
+
+    # Upsert to Supabase (idempotent on call_sid)
+    try:
+        supabase.table("leads").upsert(row, on_conflict="call_sid").execute()
+    except Exception as e:
+        print(f"[end_session] Supabase write failed: {e}")
+        raise HTTPException(status_code=503, detail="Session could not be saved. Please retry.") from e
+
+    # Return structured result
+    return EndSessionResponse(
+        session_id=session_id,
+        outcome=outcome,
+        business_name=extracted.get("business_name"),
+        contact_name=extracted.get("contact_name"),
+        phone_number=extracted.get("phone_number"),
+        notes=extracted.get("notes"),
+        followup_time=extracted.get("followup_time"),
+        transcript=transcript,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Voice pipeline endpoints (Groq STT + TTS)
+# ---------------------------------------------------------------------------
+
+GROQ_STT_MODEL = "whisper-large-v3-turbo"
+GROQ_TTS_MODEL = "canopylabs/orpheus-v1-english"
+GROQ_TTS_VOICE = "hannah"
+
+
+@app.post("/api/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """Transcribe browser-recorded audio using Groq Whisper."""
+    if groq_client is None:
+        raise HTTPException(status_code=503, detail="Groq client not available")
+
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio file")
+
+    try:
+        result = groq_client.audio.transcriptions.create(
+            model=GROQ_STT_MODEL,
+            file=(file.filename or "audio.webm", audio_bytes),
+            language="en",
+            response_format="json",
+        )
+        return {"text": result.text.strip()}
+    except Exception as e:
+        print(f"[transcribe] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
+
+
+def finalize_wav_header(audio: bytes) -> bytes:
+    """Fill streaming WAV size placeholders once the complete body is available."""
+    if audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+        return audio
+    result = bytearray(audio)
+    if result[4:8] == b"\xff" * 4:
+        struct.pack_into("<I", result, 4, len(result) - 8)
+    offset = 12
+    while offset + 8 <= len(result):
+        size = struct.unpack_from("<I", result, offset + 4)[0]
+        if result[offset:offset + 4] == b"data":
+            if size == 0xFFFFFFFF:
+                struct.pack_into("<I", result, offset + 4, len(result) - offset - 8)
+            break
+        offset += 8 + size + (size % 2)
+    return bytes(result)
+
+
+@app.post("/api/speak")
+async def speak_text(req: SpeakRequest):
+    """Synthesize text to speech using Groq TTS and return audio."""
+    if groq_client is None:
+        raise HTTPException(status_code=503, detail="Groq client not available")
+
+    text = clean_assistant_text(req.text)
+    if not text:
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    try:
+        response = groq_client.audio.speech.create(
+            model=GROQ_TTS_MODEL,
+            voice=GROQ_TTS_VOICE,
+            input=text,
+            response_format="wav",
+        )
+        audio_bytes = finalize_wav_header(response.read())
+        return Response(
+            content=audio_bytes,
+            media_type="audio/wav",
+            headers={"Content-Disposition": "inline; filename=speech.wav"},
+        )
+    except Exception as e:
+        print(f"[speak] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"TTS failed: {e}")
 
 
 @app.post("/calls/trigger")

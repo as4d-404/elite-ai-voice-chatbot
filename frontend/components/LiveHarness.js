@@ -54,6 +54,8 @@ export default function LiveHarness({ onCallStateChange }) {
   const [textInput, setTextInput] = useState("");
   const [error, setError] = useState("");
   const [outbound, setOutbound] = useState(null);
+  const [chatStatus, setChatStatus] = useState("idle"); // idle | thinking | error
+  const [recordingStatus, setRecordingStatus] = useState("idle"); // idle | recording | transcribing | speaking
 
   const statusRef = useRef("idle");
   const wsRef = useRef(null);
@@ -68,6 +70,84 @@ export default function LiveHarness({ onCallStateChange }) {
   const levelCounterRef = useRef(0);
   const speakTimerRef = useRef(null);
   const scrollRef = useRef(null);
+  const sessionIdRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const voiceAudioRef = useRef(null); // persistent Audio element for TTS playback
+
+  // Initialize persistent audio element on first user gesture (mic click / start call)
+  function ensureAudioElement() {
+    if (!voiceAudioRef.current) {
+      const audio = new Audio();
+      audio.preload = "auto";
+      voiceAudioRef.current = audio;
+    }
+    return voiceAudioRef.current;
+  }
+
+  // Shared TTS helper: called by both typed and voice paths
+  async function speakAgentReply(reply) {
+    setRecordingStatus("speaking");
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/speak`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: reply }),
+      });
+      console.log("[TTS] /api/speak status:", res.status);
+      console.log("[TTS] Content-Type:", res.headers.get("content-type"));
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `HTTP ${res.status}`);
+      }
+
+      const blob = await res.blob();
+      console.log("[TTS] blob size:", blob.size, "type:", blob.type);
+
+      if (blob.size === 0) {
+        appendBubble("system", "Voice playback unavailable (empty audio).");
+        setRecordingStatus("idle");
+        return;
+      }
+
+      const audio = ensureAudioElement();
+      const url = URL.createObjectURL(blob);
+      // Revoke previous URL if any
+      if (audio._blobUrl) URL.revokeObjectURL(audio._blobUrl);
+      audio._blobUrl = url;
+      audio.src = url;
+      audio.volume = 1;
+
+      setAgentSpeaking(true);
+      audio.onended = () => {
+        setAgentSpeaking(false);
+        setRecordingStatus("idle");
+      };
+      audio.onerror = (e) => {
+        console.error("[TTS] audio.onerror:", e);
+        setAgentSpeaking(false);
+        setRecordingStatus("idle");
+        appendBubble("system", "Voice playback unavailable.");
+      };
+
+      const playPromise = audio.play();
+      if (playPromise) {
+        playPromise
+          .then(() => console.log("[TTS] playback started"))
+          .catch((err) => {
+            console.error("[TTS] playback failed:", err);
+            setAgentSpeaking(false);
+            setRecordingStatus("idle");
+            appendBubble("system", "Voice playback blocked by browser. Click anywhere to unmute.");
+          });
+      }
+    } catch (err) {
+      console.error("[TTS] /api/speak error:", err);
+      appendBubble("system", "Voice playback unavailable.");
+      setRecordingStatus("idle");
+    }
+  }
 
   const setStatusNow = useCallback((s) => {
     statusRef.current = s;
@@ -222,6 +302,18 @@ export default function LiveHarness({ onCallStateChange }) {
     } catch {
       
     }
+    // Stop any in-progress voice recording or playback
+    try {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
+      }
+    } catch {}
+    try {
+      if (voiceAudioRef.current) {
+        voiceAudioRef.current.pause();
+        voiceAudioRef.current.src = "";
+      }
+    } catch {}
     if (speakTimerRef.current) clearTimeout(speakTimerRef.current);
   }
 
@@ -255,6 +347,7 @@ export default function LiveHarness({ onCallStateChange }) {
 
     setStatusNow("connecting");
     setBubbles([]);
+    sessionIdRef.current = crypto.randomUUID();
     testIdRef.current = `browser-test-${Date.now()}`;
     appendBubble("system", "Starting voice session…");
 
@@ -342,7 +435,42 @@ export default function LiveHarness({ onCallStateChange }) {
     setAgentSpeaking(false);
     setLevels(Array(24).fill(0));
     setStatusNow("ended");
-    appendBubble("system", "Call ended.");
+    setChatStatus("idle")
+    setRecordingStatus("idle")
+    appendBubble("system", "Call ended. Finalizing session…");
+
+    // Finalize session in backend (extract lead, save to Supabase)
+    if (sessionIdRef.current) {
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/chat/end`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionIdRef.current }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          appendBubble("system", `Session saved: ${data.outcome}`);
+          console.log("[LiveHarness] Session finalized:", data);
+          // Supabase realtime will refresh the leads panel automatically
+        } else {
+          const err = await res.json().catch(() => ({ detail: "unknown" }));
+          appendBubble("system", `Failed to save session: ${err.detail || "unknown"}`);
+        }
+      } catch (err) {
+        console.error("[LiveHarness] /api/chat/end error:", err);
+        appendBubble("system", "Failed to save session (check console).");
+      }
+
+      // Reset chat session
+      try {
+        await fetch(`${BACKEND_URL}/api/chat/reset`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionIdRef.current }),
+        });
+      } catch {}
+      sessionIdRef.current = null;
+    }
     if (outbound && outbound.callSid) {
       try {
         await fetch(`${BACKEND_URL}/calls/${outbound.callSid}/end`, { method: "POST" });
@@ -361,12 +489,164 @@ export default function LiveHarness({ onCallStateChange }) {
     });
   }
 
-  function handleSendText() {
+  async function handleSendText() {
     const t = textInput.trim();
-    if (!t || wsRef.current?.readyState !== WebSocket.OPEN) return;
+    if (!t || chatStatus === "thinking" || recordingStatus !== "idle") return;
+
+    // Create session ID on first message
+    if (!sessionIdRef.current) {
+      sessionIdRef.current = crypto.randomUUID();
+    }
+
     appendBubble("prospect", t);
-    wsRef.current.send(JSON.stringify({ type: "text", text: t }));
     setTextInput("");
+    setChatStatus("thinking");
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionIdRef.current,
+          message: t,
+        }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      appendBubble("agent", data.reply);
+      setChatStatus("idle");
+
+      // Play TTS for typed messages too (if audio element is unlocked)
+      if (voiceAudioRef.current) {
+        speakAgentReply(data.reply);
+      }
+    } catch (err) {
+      console.error("[LiveHarness] /api/chat error:", err);
+      appendBubble("system", "Unable to reach the agent.");
+      setChatStatus("error");
+    }
+  }
+
+  // --- Voice pipeline: record → transcribe → chat → speak → play ---
+
+  async function toggleRecording() {
+    if (recordingStatus === "recording") {
+      // Stop recording
+      mediaRecorderRef.current?.stop();
+      return;
+    }
+
+    if (recordingStatus !== "idle") return; // already processing
+
+    try {
+      // Initialize audio element on user gesture (unlocks autoplay)
+      ensureAudioElement();
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+          ? "audio/webm;codecs=opus"
+          : "audio/webm",
+      });
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
+        await processVoiceAudio(audioBlob);
+      };
+
+      mediaRecorder.start();
+      setRecordingStatus("recording");
+    } catch (err) {
+      console.error("[LiveHarness] Microphone access denied:", err);
+      appendBubble("system", "Microphone access denied — allow mic access to use voice.");
+    }
+  }
+
+  async function processVoiceAudio(audioBlob) {
+    setRecordingStatus("transcribing");
+
+    // Ensure session exists
+    if (!sessionIdRef.current) {
+      sessionIdRef.current = crypto.randomUUID();
+    }
+
+    // 1. Transcribe
+    let transcript;
+    try {
+      const formData = new FormData();
+      formData.append("file", audioBlob, "recording.webm");
+      const res = await fetch(`${BACKEND_URL}/api/transcribe`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      transcript = data.text.trim();
+    } catch (err) {
+      console.error("[LiveHarness] /api/transcribe error:", err);
+      appendBubble("system", "Unable to transcribe audio.");
+      setRecordingStatus("idle");
+      return;
+    }
+
+    if (!transcript) {
+      appendBubble("system", "No speech detected.");
+      setRecordingStatus("idle");
+      return;
+    }
+
+    // 2. Show transcript ONCE as prospect bubble
+    appendBubble("prospect", transcript);
+
+    // 3. Send transcript to /api/chat
+    setChatStatus("thinking");
+    let reply;
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionIdRef.current,
+          message: transcript,
+        }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      reply = data.reply;
+    } catch (err) {
+      console.error("[LiveHarness] /api/chat error:", err);
+      appendBubble("system", "Unable to reach the agent.");
+      setChatStatus("error");
+      setRecordingStatus("idle");
+      return;
+    }
+
+    // 4. Show agent reply ONCE
+    appendBubble("agent", reply);
+    setChatStatus("idle");
+
+    // 5. Send to /api/speak and play (shared helper)
+    await speakAgentReply(reply);
   }
 
   const meta = STATUS_META[status] || STATUS_META.idle;
@@ -390,12 +670,40 @@ export default function LiveHarness({ onCallStateChange }) {
             </span>
           ) : null}
           <span
-            className={`inline-flex items-center gap-2 rounded-full border px-3.5 py-1.5 text-xs font-medium ${meta.pill}`}
+            className={`inline-flex items-center gap-2 rounded-full border px-3.5 py-1.5 text-xs font-medium ${
+              recordingStatus === "recording"
+                ? "border-rose-500/40 bg-rose-500/10 text-rose-300"
+                : recordingStatus === "transcribing"
+                ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
+                : recordingStatus === "speaking"
+                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                : chatStatus === "thinking"
+                ? "border-amber-500/40 bg-amber-500/10 text-amber-300"
+                : meta.pill
+            }`}
           >
             <span
-              className={`inline-block h-2 w-2 rounded-full ${meta.dot} ${meta.ring ? "pulse-dot text-emerald-400" : ""}`}
+              className={`inline-block h-2 w-2 rounded-full ${
+                recordingStatus === "recording"
+                  ? "bg-rose-400 animate-pulse"
+                  : recordingStatus === "transcribing"
+                  ? "bg-amber-400 animate-pulse"
+                  : recordingStatus === "speaking"
+                  ? "bg-emerald-400"
+                  : chatStatus === "thinking"
+                  ? "bg-amber-400 animate-pulse"
+                  : `${meta.dot} ${meta.ring ? "pulse-dot text-emerald-400" : ""}`
+              }`}
             />
-            {meta.label}
+            {recordingStatus === "recording"
+              ? "Recording…"
+              : recordingStatus === "transcribing"
+              ? "Transcribing…"
+              : recordingStatus === "speaking"
+              ? "Speaking…"
+              : chatStatus === "thinking"
+              ? "Thinking…"
+              : meta.label}
           </span>
         </div>
       </header>
@@ -406,7 +714,7 @@ export default function LiveHarness({ onCallStateChange }) {
             <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
               <Bot className="h-12 w-12 text-cyan-500/50" />
               <p className="max-w-sm text-sm text-zinc-500">
-                Start a call to begin the conversation.
+                Start a call or type a message to begin the conversation.
               </p>
             </div>
           )}
@@ -447,7 +755,7 @@ export default function LiveHarness({ onCallStateChange }) {
                   {isAgent && (
                     <div className="mb-1 flex items-center justify-between gap-3">
                       <span className="text-[11px] font-semibold uppercase tracking-wide text-cyan-300">
-                        Jordan · Elite AI
+                        Maya · Elite AI
                       </span>
                       <span className="text-[10px] tabular-nums text-zinc-500">{b.time}</span>
                     </div>
@@ -469,7 +777,19 @@ export default function LiveHarness({ onCallStateChange }) {
                   <span />
                   <span />
                 </span>
-                <span className="text-xs text-cyan-300">Jordan speaking…</span>
+                <span className="text-xs text-cyan-300">Maya speaking…</span>
+              </div>
+            </div>
+          )}
+
+          {chatStatus === "thinking" && !agentSpeaking && (
+            <div className="bubble-in flex items-center gap-3">
+              <div className="flex h-8 w-8 items-center justify-center rounded-full border border-cyan-500/40 bg-cyan-500/20 text-cyan-300">
+                <Bot className="h-4 w-4" />
+              </div>
+              <div className="flex items-center gap-2 rounded-full border border-cyan-500/25 bg-zinc-900/90 px-4 py-2">
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-cyan-300" />
+                <span className="text-xs text-cyan-300">Thinking…</span>
               </div>
             </div>
           )}
@@ -492,6 +812,29 @@ export default function LiveHarness({ onCallStateChange }) {
             />
           </div>
 
+          <div className="flex items-center gap-2">
+            <input
+              value={textInput}
+              onChange={(e) => setTextInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSendText(); } }}
+              placeholder="Type a message to Maya…"
+              disabled={chatStatus === "thinking" || recordingStatus !== "idle"}
+              className="flex-1 rounded-lg border border-zinc-700/60 bg-zinc-900/70 px-3 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none focus:border-cyan-500/60 disabled:opacity-50"
+            />
+            <button
+              onClick={handleSendText}
+              disabled={!textInput.trim() || chatStatus === "thinking" || recordingStatus !== "idle"}
+              aria-label="Send message"
+              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-cyan-500/40 bg-cyan-500/15 text-cyan-300 transition hover:bg-cyan-500/25 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {chatStatus === "thinking" ? (
+                <Loader2 className="h-5 w-5 animate-spin" />
+              ) : (
+                <Send className="h-5 w-5" />
+              )}
+            </button>
+          </div>
+
           <div className="flex items-center gap-3">
             <div className="wave-track" aria-hidden="true">
               {levels.map((l, i) => (
@@ -499,18 +842,23 @@ export default function LiveHarness({ onCallStateChange }) {
               ))}
             </div>
 
+            {/* Push-to-talk mic button */}
             <button
-              onClick={toggleMute}
-              disabled={status !== "live"}
-              aria-label={muted ? "Unmute microphone" : "Mute microphone"}
-              title={muted ? "Unmute" : "Mute"}
+              onClick={toggleRecording}
+              disabled={recordingStatus === "transcribing" || recordingStatus === "speaking"}
+              aria-label={recordingStatus === "recording" ? "Stop recording" : "Start recording"}
+              title={recordingStatus === "recording" ? "Stop recording" : "Push to talk"}
               className={`flex h-11 w-11 items-center justify-center rounded-full border transition ${
-                muted
-                  ? "border-rose-500/50 bg-rose-500/15 text-rose-300"
+                recordingStatus === "recording"
+                  ? "border-rose-500/60 bg-rose-500/20 text-rose-300 animate-pulse"
                   : "border-zinc-600/60 bg-zinc-900/70 text-zinc-300 hover:border-cyan-500/50"
-              } ${status !== "live" ? "cursor-not-allowed opacity-40" : ""}`}
+              } ${recordingStatus === "transcribing" || recordingStatus === "speaking" ? "cursor-not-allowed opacity-40" : ""}`}
             >
-              {muted ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+              {recordingStatus === "recording" ? (
+                <StopCircle className="h-5 w-5" />
+              ) : (
+                <Mic className="h-5 w-5" />
+              )}
             </button>
 
             {status === "live" ? (
@@ -541,7 +889,7 @@ export default function LiveHarness({ onCallStateChange }) {
         {error && <p className="mx-4 mt-2 text-xs text-rose-400">{error}</p>}
         {!phoneNumber.trim() && (
           <p className="mx-4 mt-2 text-[11px] text-zinc-500">
-            Leave phone blank for browser voice test · enter E.164 number for Twilio call
+            Click mic to push-to-talk · type a message to text chat · leave phone blank for browser voice test
           </p>
         )}
       </section>

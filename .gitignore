@@ -18,10 +18,13 @@ __pycache__/
 !supabase/schema.sql
 
 # OS
-.DS_Storenode_modules/
+.DS_Store
+node_modules/
 frontend/node_modules/
 .next/
 frontend/.next/
 .env*
 venv/
 backend/venv/
+
+*.log

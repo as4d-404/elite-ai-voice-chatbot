@@ -1,10 +1,10 @@
--- AIAURA Outbound Sales Agent — Supabase schema
+-- Elite AI Voice Agent — Supabase schema
 -- Run this in the Supabase SQL editor for your project.
 
 create table if not exists leads (
   id uuid primary key default gen_random_uuid(),
-  call_sid text unique,                        -- Twilio Call SID
-  phone_number text not null,
+  call_sid text unique,                        -- unique browser session ID or legacy call SID
+  phone_number text,
   business_name text,
   contact_name text,
   call_status text,         -- technical call state: no-answer, busy, failed, canceled, completed
@@ -17,6 +17,9 @@ create table if not exists leads (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+-- Browser sessions may have no phone number; safe for existing tables.
+alter table public.leads alter column phone_number drop not null;
 
 -- Keep updated_at fresh on every write
 create or replace function set_updated_at()
